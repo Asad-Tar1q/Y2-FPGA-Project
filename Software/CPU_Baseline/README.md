@@ -93,6 +93,7 @@ make test
 - **Memory**: TBD (varies with field resolution)
 - **Graphics**: OpenGL support for rendering
 - **OS**: Windows, Linux, macOS
+- **FPGA Compatibility**: Runs standalone, but designed for comparison with PYNQ-Z1 implementation
 
 ## Performance Baseline
 This implementation should establish:

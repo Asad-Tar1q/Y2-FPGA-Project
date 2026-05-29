@@ -10,7 +10,7 @@ This is the hardware implementation of the FPGA-based Electromagnetic (EM) Field
 - Optimize resource utilization on target FPGA device
 
 ## Hardware Architecture
-- **Target Platform**: Xilinx FPGA (Vivado-based design)
+- **Target Platform**: Xilinx PYNQ-Z1 FPGA Board (Vivado 2023.2)
 - **Primary Functions**: EM field algorithms, mathematical computations, data formatting
 - **Interfaces**: PCIe/memory interfaces for host communication
 
@@ -57,8 +57,8 @@ This is the hardware implementation of the FPGA-based Electromagnetic (EM) Field
 4. Program FPGA device
 
 ## Dependencies
-- Xilinx Vivado (version TBD)
-- FPGA development board (TBD)
+- Xilinx Vivado 2023.2
+- PYNQ-Z1 development board
 - Development environment with design tools
 
 ## Notes

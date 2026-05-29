@@ -25,9 +25,10 @@ This is the software implementation of the FPGA-based Electromagnetic (EM) Field
 
 ## System Requirements
 - **Display Resolution**: 640 x 480 (required)
+- **FPGA Hardware**: PYNQ-Z1 development board with Vivado 2023.2 bitstream
 - GPU with OpenGL support
 - Minimum RAM: TBD
-- FPGA device connected via PCIe
+- FPGA device connected via USB/network
 
 ## To-Do List
 
