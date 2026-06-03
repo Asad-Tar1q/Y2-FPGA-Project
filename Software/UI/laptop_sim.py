@@ -7,8 +7,10 @@ import numpy as np
 import pygame
 import matplotlib.cm as cm
 
+from numba import cuda
+
 PYNQ_IP = "192.168.2.99"
-PYNQ_PORT = 5050
+PYNQ_PORT = 5000
 WIDTH, HEIGHT = 640, 480
 FRAME_BYTES = WIDTH * HEIGHT  # uint8 grayscale/field values
 
@@ -52,6 +54,16 @@ def _receive_thread(sock: socket.socket) -> None:
             _latest_frame = frame  # overwrite; drop-on-busy is implicit
 
 
+@cuda.jit
+def GPU_render(frame_flat, lut, rgb_out):
+    #make sure threads run in parallel
+    idx = cuda.grid(1)
+    if idx < frame_flat.size:
+        val = frame_flat[idx]
+        rgb_out[idx, 0] = lut[val, 0]
+        rgb_out[idx, 1] = lut[val, 1]
+        rgb_out[idx, 2] = lut[val, 2]
+
 def main() -> None:
     global _latest_frame
 
@@ -70,6 +82,13 @@ def main() -> None:
     pygame.display.set_caption("PYNQ Frame Viewer")
     clock = pygame.time.Clock()
 
+    #upload LUT to GPU once
+    d_lut = cuda.to_device(LUT)
+    #create an output buffer
+    d_rgb_flat = cuda.device_array((HEIGHT * WIDTH, 3), dtype=np.uint8)
+    THREADS = 256
+    BLOCKS = (WIDTH * HEIGHT + THREADS - 1) // THREADS
+
     # Step 6: throughput tracking
     display_frames = 0
     fps_timer = time.monotonic()
@@ -87,14 +106,16 @@ def main() -> None:
             if frame is not None:
                 frame = frame.copy()  # release lock immediately after copy
 
+        
+        
         if frame is not None:
-            # Step 3/4: Apply LUT → RGB, then blit
-            rgb = LUT[frame]                          # (H, W, 3) uint8
-            # surfarray expects (W, H, 3)
+            d_frame = cuda.to_device(frame.ravel())
+            GPU_render[BLOCKS, THREADS](d_frame, d_lut, d_rgb_flat)
+            #do the ouput on cpu
+            rgb = d_rgb_flat.copy_to_host().reshape((HEIGHT, WIDTH, 3))
             surface = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
             screen.blit(surface, (0, 0))
             pygame.display.flip()
-
             display_frames += 1
 
         # Step 6: print fps every second
@@ -105,7 +126,7 @@ def main() -> None:
             display_frames = 0
             fps_timer = now
 
-        # Step 5: cap at 60 fps
+        #cap at 60 fps - the server bottlenecks to ~70fps
         clock.tick(60)
 
 
