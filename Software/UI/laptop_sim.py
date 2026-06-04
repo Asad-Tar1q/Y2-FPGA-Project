@@ -7,9 +7,14 @@ import numpy as np
 import pygame
 import matplotlib.cm as cm
 
-from numba import cuda
+try:
+    from numba import cuda
+    _CUDA_AVAILABLE = True
+except Exception:
+    cuda = None
+    _CUDA_AVAILABLE = False
 
-PYNQ_IP = "192.168.2.99"
+PYNQ_IP = "127.0.0.1"
 PYNQ_PORT = 5000
 WIDTH, HEIGHT = 640, 480
 FRAME_BYTES = WIDTH * HEIGHT  # uint8 grayscale/field values
@@ -54,15 +59,18 @@ def _receive_thread(sock: socket.socket) -> None:
             _latest_frame = frame  # overwrite; drop-on-busy is implicit
 
 
-@cuda.jit
-def GPU_render(frame_flat, lut, rgb_out):
-    #make sure threads run in parallel
-    idx = cuda.grid(1)
-    if idx < frame_flat.size:
-        val = frame_flat[idx]
-        rgb_out[idx, 0] = lut[val, 0]
-        rgb_out[idx, 1] = lut[val, 1]
-        rgb_out[idx, 2] = lut[val, 2]
+if _CUDA_AVAILABLE:
+    @cuda.jit
+    def GPU_render(frame_flat, lut, rgb_out):
+        #make sure threads run in parallel
+        idx = cuda.grid(1)
+        if idx < frame_flat.size:
+            val = frame_flat[idx]
+            rgb_out[idx, 0] = lut[val, 0]
+            rgb_out[idx, 1] = lut[val, 1]
+            rgb_out[idx, 2] = lut[val, 2]
+else:
+    GPU_render = None
 
 def main() -> None:
     global _latest_frame
@@ -82,12 +90,19 @@ def main() -> None:
     pygame.display.set_caption("PYNQ Frame Viewer")
     clock = pygame.time.Clock()
 
-    #upload LUT to GPU once
-    d_lut = cuda.to_device(LUT)
-    #create an output buffer
-    d_rgb_flat = cuda.device_array((HEIGHT * WIDTH, 3), dtype=np.uint8)
-    THREADS = 256
-    BLOCKS = (WIDTH * HEIGHT + THREADS - 1) // THREADS
+    # Try GPU upload; fall back to CPU rendering if CUDA not available
+    use_cuda = _CUDA_AVAILABLE
+    if use_cuda:
+        try:
+            d_lut = cuda.to_device(LUT)
+            d_rgb_flat = cuda.device_array((HEIGHT * WIDTH, 3), dtype=np.uint8)
+            THREADS = 256
+            BLOCKS = (WIDTH * HEIGHT + THREADS - 1) // THREADS
+        except Exception as e:
+            print("CUDA runtime unavailable, falling back to CPU rendering:", e)
+            use_cuda = False
+    else:
+        print("CUDA not available — using CPU rendering path")
 
     # Step 6: throughput tracking
     display_frames = 0
@@ -109,10 +124,15 @@ def main() -> None:
         
         
         if frame is not None:
-            d_frame = cuda.to_device(frame.ravel())
-            GPU_render[BLOCKS, THREADS](d_frame, d_lut, d_rgb_flat)
-            #do the ouput on cpu
-            rgb = d_rgb_flat.copy_to_host().reshape((HEIGHT, WIDTH, 3))
+            if use_cuda:
+                d_frame = cuda.to_device(frame.ravel())
+                GPU_render[BLOCKS, THREADS](d_frame, d_lut, d_rgb_flat)
+                # copy back to host
+                rgb = d_rgb_flat.copy_to_host().reshape((HEIGHT, WIDTH, 3))
+            else:
+                # CPU: map uint8 values through LUT (fast numpy indexing)
+                rgb = LUT[frame]
+
             surface = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
             screen.blit(surface, (0, 0))
             pygame.display.flip()

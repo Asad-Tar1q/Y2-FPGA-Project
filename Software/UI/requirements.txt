@@ -1,0 +1,4 @@
+pygame>=2.5.0
+numpy>=1.24.0
+# Optional — enables GPU colour mapping (falls back to NumPy if unavailable)
+# numba>=0.58.0
