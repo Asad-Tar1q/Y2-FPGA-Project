@@ -12,6 +12,7 @@ import struct
 import math
 
 import pygame
+import pygame.freetype
 import numpy as np
 
 # ── Dimensions ─────────────────────────────────────────────────────────────────
@@ -22,7 +23,7 @@ FIELD_H     = 480
 PANEL_X     = 640
 PANEL_W     = 280
 GRID_STEP   = 40
-MAX_SOURCES = 8
+MAX_SOURCES = 5
 MAX_VIS     = 6       # max source-list rows before scrolling
 MIN_SEP     = 26      # minimum center-to-center px between sources
 
@@ -62,12 +63,43 @@ _d_lut      = None
 _gpu_render = None
 
 
+class RenderFont:
+    def __init__(self, font):
+        self._font = font
+
+    def render(self, text, antialias, color):
+        surf, _ = self._font.render(text, fgcolor=color)
+        return surf
+
+    def size(self, text):
+        rect = self._font.get_rect(text)
+        return rect.width, rect.height
+
+    def render_to(self, surf, pos, text, color):
+        self._font.render_to(surf, pos, text, fgcolor=color)
+
+
 def _build_viridis() -> np.ndarray:
-    t = np.linspace(0.0, 1.0, 256)
-    r = np.clip(0.267 + 0.004*t + 2.334*t**2 - 3.567*t**3 + 1.765*t**4, 0, 1)
-    g = np.clip(0.005 + 1.466*t - 0.720*t**2 + 0.222*t**3 - 0.028*t**4, 0, 1)
-    b = np.clip(0.329 + 1.498*t - 4.773*t**2 + 5.282*t**3 - 2.143*t**4, 0, 1)
-    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
+    """Custom RdBu LUT:
+    - negative -> blue (#2166AC)
+    - zero     -> white (#F7F7F7)
+    - positive -> red (#B2182B)
+    """
+    neg = np.array([33, 102, 172], dtype=np.float32)   # #2166AC
+    zero = np.array([247, 247, 247], dtype=np.float32)  # #F7F7F7
+    pos = np.array([178, 24, 43], dtype=np.float32)    # #B2182B
+
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        t = i / 255.0
+        if t <= 0.5:
+            u = t / 0.5
+            col = (1 - u) * neg + u * zero
+        else:
+            u = (t - 0.5) / 0.5
+            col = (1 - u) * zero + u * pos
+        lut[i] = np.clip(col + 0.5, 0, 255).astype(np.uint8)
+    return lut
 
 
 def _init_lut():
@@ -151,6 +183,11 @@ def _recv_loop():
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(3.0)
             s.connect((HOST, FRAME_PORT))
+            # disable Nagle to reduce latency
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             s.settimeout(None)
             print("[client] frame stream connected")
             buf = b""
@@ -170,9 +207,14 @@ def _recv_loop():
                     buf += chunk
                 raw = buf[:length]
                 buf = buf[length:]
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(FIELD_H, FIELD_W)
-                with _frame_lock:
-                    _latest_frame = frame.copy()
+                # If server sends RGB (3 bytes per pixel) store raw bytes, else store grayscale array
+                if length == FIELD_W * FIELD_H * 3:
+                    with _frame_lock:
+                        _latest_frame = raw
+                else:
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(FIELD_H, FIELD_W)
+                    with _frame_lock:
+                        _latest_frame = frame.copy()
                 n += 1
                 now = time.monotonic()
                 if now - t0 >= 1.0:
@@ -342,13 +384,29 @@ class WaveFormApp:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode(
-            (WINDOW_W, WINDOW_H), pygame.SCALED | pygame.RESIZABLE)
+            (WINDOW_W, WINDOW_H), pygame.RESIZABLE | pygame.SCALED)
         pygame.display.set_caption("WaveForm — EM Field Renderer")
         self.clock  = pygame.time.Clock()
 
-        self.font_title = pygame.font.SysFont("Courier New", 20, bold=True)
-        self.font_md    = pygame.font.SysFont("Courier New", 14, bold=True)
-        self.font_sm    = pygame.font.SysFont("Courier New", 11)
+        self.font_title = RenderFont(pygame.freetype.SysFont("Courier New", 20, bold=True))
+        self.font_md    = RenderFont(pygame.freetype.SysFont("Courier New", 14, bold=True))
+        self.font_sm    = RenderFont(pygame.freetype.SysFont("Courier New", 11))
+
+        # Pre-render static field background and grid overlay for faster blits
+        self._field_bg = pygame.Surface((FIELD_W, FIELD_H))
+        self._field_bg.fill(C_BG)
+
+        self._field_grid = pygame.Surface((FIELD_W, FIELD_H), pygame.SRCALPHA)
+        grid_color = (255, 255, 255, 120)  # white lines with slight transparency
+        for x in range(0, FIELD_W + 1, GRID_STEP):
+            pygame.draw.line(self._field_grid, grid_color, (x, 0), (x, FIELD_H))
+        for y in range(0, FIELD_H + 1, GRID_STEP):
+            pygame.draw.line(self._field_grid, grid_color, (0, y), (FIELD_W, y))
+        try:
+            self._field_bg = self._field_bg.convert()
+            self._field_grid = self._field_grid.convert_alpha()
+        except Exception:
+            pass
 
         self.antennas: list[Antenna] = [Antenna()]
         self.sel         = 0
@@ -376,6 +434,12 @@ class WaveFormApp:
         self._disp_t      = time.monotonic()
 
     # ── Sync helpers ───────────────────────────────────────────────────────────
+    def _source_label(self, index: int) -> str:
+        return f"A{index + 1}"
+
+    def _source_colour(self, index: int):
+        return SOURCE_COLS[index % len(SOURCE_COLS)]
+
     def _sync_sliders(self):
         if not self.antennas:
             self._amp_sl.dragging  = False
@@ -383,7 +447,7 @@ class WaveFormApp:
             return
         a = self.antennas[self.sel]
         self._amp_sl.value     = a.amplitude
-        self._amp_sl.fill_col  = a.colour
+        self._amp_sl.fill_col  = self._source_colour(self.sel)
         self._freq_sl.value    = a.frequency
         self._amp_sl.dragging  = False
         self._freq_sl.dragging = False
@@ -471,7 +535,7 @@ class WaveFormApp:
             elif ev.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
                 self._del_ant()
 
-        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             mx, my = ev.pos
             if mx < FIELD_W:
                 self._field_click(mx, my)
@@ -555,35 +619,47 @@ class WaveFormApp:
     # ── Drawing ────────────────────────────────────────────────────────────────
     def _draw(self):
         self.screen.fill(C_BG)
-        self._draw_field()
-        self._draw_panel()
+        self._draw_field(self.screen)
+        self._draw_panel(self.screen)
 
     # ── Field ──────────────────────────────────────────────────────────────────
-    def _draw_field(self):
-        s = self.screen
+    def _draw_field(self, s):
 
-        # Grid
-        for x in range(0, FIELD_W + 1, GRID_STEP):
-            pygame.draw.line(s, C_BORDER, (x, 0), (x, FIELD_H))
-        for y in range(0, FIELD_H + 1, GRID_STEP):
-            pygame.draw.line(s, C_BORDER, (0, y), (FIELD_W, y))
+        # Grid (pre-rendered)
+        s.blit(self._field_bg, (0, 0))
 
         # Frame overlay
         with _frame_lock:
             frame = _latest_frame
         if frame is not None:
-            rgb  = apply_lut(frame)
-            surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-            surf.set_alpha(210)
-            s.blit(surf, (0, 0))
+            # if frame is raw RGB bytes (3 bytes per pixel) we can blit directly
+            if isinstance(frame, (bytes, bytearray)) and len(frame) == FIELD_W * FIELD_H * 3:
+                try:
+                    surf = pygame.image.frombuffer(frame, (FIELD_W, FIELD_H), 'RGB')
+                    s.blit(surf, (0, 0))
+                except Exception:
+                    # fallback to LUT path
+                    rgb = apply_lut(np.frombuffer(frame, dtype=np.uint8).reshape(FIELD_H, FIELD_W))
+                    surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                    s.blit(surf, (0, 0))
+            else:
+                rgb  = apply_lut(frame)
+                surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                surf.set_alpha(210)
+                s.blit(surf, (0, 0))
+
+        # Grid overlay
+        s.blit(self._field_grid, (0, 0))
 
         # Source dots
         for i, a in enumerate(self.antennas):
             ix, iy = int(a.x), int(a.y)
+            col = self._source_colour(i)
+            label = self._source_label(i)
             if i == self.sel:
                 pygame.draw.circle(s, C_WHITE, (ix, iy), 14, 2)
-            pygame.draw.circle(s, a.colour, (ix, iy), 10)
-            lbl = self.font_sm.render(a.label, True, C_WHITE)
+            pygame.draw.circle(s, col, (ix, iy), 10)
+            lbl = self.font_sm.render(label, True, C_WHITE)
             s.blit(lbl, (ix - lbl.get_width() // 2, iy - lbl.get_height() // 2))
 
         # HUD
@@ -603,9 +679,9 @@ class WaveFormApp:
             s.blit(t, (10, 9 + i * lh))
 
     # ── Panel ──────────────────────────────────────────────────────────────────
-    def _draw_panel(self):
-        s  = self.screen
+    def _draw_panel(self, s):
         px = PANEL_X
+        pw = PANEL_W
         pw = PANEL_W
 
         # Background
@@ -646,8 +722,10 @@ class WaveFormApp:
             if ant_i == self.sel:
                 draw_fill  (s, row_r, 4, C_SELROW, alpha=255)
                 draw_border(s, row_r, 4, C_CYAN,   alpha=255, w=1)
-            pygame.draw.circle(s, a.colour, (px + 20, ry + row_h // 2), 5)
-            lbl  = self.font_sm.render(a.label, True, C_WHITE)
+            col = self._source_colour(ant_i)
+            label = self._source_label(ant_i)
+            pygame.draw.circle(s, col, (px + 20, ry + row_h // 2), 5)
+            lbl  = self.font_sm.render(label, True, C_WHITE)
             s.blit(lbl,  (px + 30,  ry + 5))
             amp  = self.font_sm.render(f"{a.amplitude:.2f}", True, C_SEC)
             s.blit(amp,  (px + 58,  ry + 5))
@@ -698,14 +776,16 @@ class WaveFormApp:
             ant = self.antennas[self.sel]
 
             # Sub-header (dot + label)
-            pygame.draw.circle(s, ant.colour, (px + 20, ctrl_y + 13), 6)
-            hdr = self.font_md.render(ant.label, True, C_WHITE)
+            col = self._source_colour(self.sel)
+            label = self._source_label(self.sel)
+            pygame.draw.circle(s, col, (px + 20, ctrl_y + 13), 6)
+            hdr = self.font_md.render(label, True, C_WHITE)
             s.blit(hdr, (px + 32, ctrl_y + 5))
 
             # Update slider rects (preserves dragging state)
             sl_x = px + 16
             sl_w = pw - 32
-            self._amp_sl.fill_col = ant.colour
+            self._amp_sl.fill_col = col
             self._amp_sl.set_rect (sl_x, ctrl_y + 40, sl_w)
             self._freq_sl.set_rect(sl_x, ctrl_y + 86, sl_w)
 
@@ -730,13 +810,13 @@ class WaveFormApp:
             draw_border(s, mm_r, 4, C_MINT, alpha=76)
             dot_x = mm_x + int(ant.x / FIELD_W * mm_w)
             dot_y = mm_y + int(ant.y / FIELD_H * mm_h)
-            pygame.draw.circle(s, ant.colour, (dot_x, dot_y), 3)
+            pygame.draw.circle(s, col, (dot_x, dot_y), 3)
             drag_t = self.font_sm.render("drag on field", True, C_SEC)
             s.blit(drag_t, (mm_x + mm_w + 6, mm_y + 20))
 
         # ── Footer ─────────────────────────────────────────────────────────────
         foot = self.font_sm.render(
-            "Tab: cycle   Del: remove   F11: fullscreen", True, C_SEC)
+            "Tab: cycle   Del: remove", True, C_SEC)
         s.blit(foot, (px + 8, WINDOW_H - 16))
 
 
