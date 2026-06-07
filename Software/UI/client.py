@@ -3,8 +3,8 @@ WaveForm — EM Field Renderer client (ModernGL + pyimgui).
 Run:  python client.py
 """
 
-# Must be set before any OpenGL import — tells PyOpenGL to use EGL for
-# context detection instead of GLX (GLFW on WSL2/Mesa uses EGL under the hood)
+# Must be set before any OpenGL import — tells PyOpenGL to use GLX for
+# context detection (GLFW on WSL2/Mesa uses GLX)
 import os
 os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
 
@@ -19,7 +19,7 @@ import glfw
 import moderngl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
-import matplotlib.cm as cm
+import matplotlib
 
 # ── Dimensions ─────────────────────────────────────────────────────────────────
 WINDOW_W    = 920
@@ -36,8 +36,8 @@ MIN_SEP     = 26
 HOST       = "127.0.0.1"
 FRAME_PORT = 5000
 CTRL_PORT  = 5001
-CTRL_FMT   = ">BBHHff2x"
-CTRL_SIZE  = struct.calcsize(CTRL_FMT)
+CTRL_FMT   = ">BBHHffff"
+CTRL_SIZE  = struct.calcsize(CTRL_FMT)   # 20 bytes
 SEND_HZ    = 30
 
 SOURCE_COLS_F = [
@@ -63,6 +63,8 @@ class Antenna:
         self.y         = float(y)
         self.amplitude = float(amplitude)
         self.frequency = float(frequency)
+        self.theta_0   = 0.0   # antenna direction, radians [0, 2π]
+        self.a         = 0.0   # directionality: 0=isotropic, 1=log-periodic
 
     @property
     def colour(self):
@@ -80,6 +82,7 @@ _recv_fps     = 0.0
 _ctrl_sock    = None
 _ctrl_lock    = threading.Lock()
 _last_send_t  = 0.0
+_paused       = False
 
 
 def _recv_loop():
@@ -141,7 +144,10 @@ def _raw_send(ant):
     msg = struct.pack(CTRL_FMT,
                       ant.id & 0xFF, 0,
                       int(ant.x) & 0xFFFF, int(ant.y) & 0xFFFF,
-                      ant.amplitude, ant.frequency)
+                      max(0.0, min(1.0, ant.amplitude)),
+                      ant.frequency,
+                      ant.theta_0,
+                      max(0.0, min(1.0, ant.a)))
     with _ctrl_lock:
         if _ctrl_sock:
             try:
@@ -165,7 +171,17 @@ def send_all(antennas):
 
 
 def send_delete(ant_id):
-    msg = struct.pack(CTRL_FMT, ant_id & 0xFF, 1, 0, 0, 0.0, 0.0)
+    msg = struct.pack(CTRL_FMT, ant_id & 0xFF, 1, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    with _ctrl_lock:
+        if _ctrl_sock:
+            try:
+                _ctrl_sock.sendall(msg)
+            except Exception:
+                pass
+
+
+def send_pause_toggle():
+    msg = struct.pack(CTRL_FMT, 0, 2, 0, 0, 0.0, 0.0, 0.0, 0.0)
     with _ctrl_lock:
         if _ctrl_sock:
             try:
@@ -278,7 +294,6 @@ class WaveFormApp:
         self.field_tex = ctx.texture((FIELD_W, FIELD_H), components=1, dtype='f1')
         self.field_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
-        import matplotlib
         lut_data = (matplotlib.colormaps["viridis"](np.linspace(0, 1, 256))[:, :3] * 255
                     ).astype(np.uint8)
         self.lut_tex = ctx.texture((256, 1), components=3, dtype='f1',
@@ -291,16 +306,16 @@ class WaveFormApp:
         self.field_prog['viridis'] = 1
 
         rx = px_to_ndc_x(FIELD_W)
-        # Interleaved pos(x,y) + uv(u,v). UV flips Y so row-0 of the numpy
-        # array (image top) maps to the top of the screen.
+        # Interleaved pos(x,y) + uv(u,v). UV flips Y so numpy row-0 (image top)
+        # maps to screen top.
         quad_data = np.array([
             # pos_x  pos_y   uv_u  uv_v
-            -1.0,   -1.0,   0.0,  1.0,   # bottom-left
-             rx,    -1.0,   1.0,  1.0,   # bottom-right
-            -1.0,    1.0,   0.0,  0.0,   # top-left
-             rx,    -1.0,   1.0,  1.0,   # bottom-right
-             rx,     1.0,   1.0,  0.0,   # top-right
-            -1.0,    1.0,   0.0,  0.0,   # top-left
+            -1.0,   -1.0,   0.0,  1.0,
+             rx,    -1.0,   1.0,  1.0,
+            -1.0,    1.0,   0.0,  0.0,
+             rx,    -1.0,   1.0,  1.0,
+             rx,     1.0,   1.0,  0.0,
+            -1.0,    1.0,   0.0,  0.0,
         ], dtype='f4')
         self.field_vbo = ctx.buffer(quad_data.tobytes())
         self.field_vao = ctx.vertex_array(
@@ -370,10 +385,14 @@ class WaveFormApp:
                 self._last_drag_t = now
 
     def _key_cb(self, win, key, scancode, action, mods):
+        global _paused
         if imgui.get_io().want_capture_keyboard:
             return
         if action == glfw.PRESS:
-            if key == glfw.KEY_TAB and self.antennas:
+            if key == glfw.KEY_SPACE:
+                _paused = not _paused
+                send_pause_toggle()
+            elif key == glfw.KEY_TAB and self.antennas:
                 self.sel = (self.sel + 1) % len(self.antennas)
             elif key == glfw.KEY_DELETE:
                 self._del_ant()
@@ -468,6 +487,7 @@ class WaveFormApp:
 
     # ── ImGui panel ────────────────────────────────────────────────────────────
     def _draw_panel(self):
+        global _paused
         imgui.push_style_color(imgui.COLOR_WINDOW_BACKGROUND,  0.059, 0.125, 0.208, 1.0)
         imgui.push_style_color(imgui.COLOR_TEXT,               0.847, 0.906, 0.969, 1.0)
         imgui.push_style_color(imgui.COLOR_FRAME_BACKGROUND,   0.043, 0.098, 0.161, 1.0)
@@ -485,7 +505,6 @@ class WaveFormApp:
         flags = (imgui.WINDOW_NO_TITLE_BAR |
                  imgui.WINDOW_NO_RESIZE     |
                  imgui.WINDOW_NO_MOVE       |
-                 imgui.WINDOW_NO_SCROLLBAR  |
                  imgui.WINDOW_NO_SAVED_SETTINGS)
 
         imgui.set_next_window_position(PANEL_X, 0)
@@ -503,6 +522,19 @@ class WaveFormApp:
 
         imgui.separator()
 
+        # Pause / Resume button
+        pause_label = "|| Pause" if not _paused else ">  Resume"
+        p_col = (0.863, 0.275, 0.275, 1.0) if not _paused else (0.275, 0.784, 0.275, 1.0)
+        imgui.push_style_color(imgui.COLOR_TEXT,           *p_col)
+        imgui.push_style_color(imgui.COLOR_BUTTON,         0.043, 0.098, 0.161, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, p_col[0], p_col[1], p_col[2], 0.3)
+        if imgui.button(pause_label, width=PANEL_W - 16):
+            _paused = not _paused
+            send_pause_toggle()
+        imgui.pop_style_color(3)
+
+        imgui.separator()
+
         # Source list
         dl = imgui.get_window_draw_list()
         for i, ant in enumerate(self.antennas):
@@ -511,10 +543,9 @@ class WaveFormApp:
             dl.add_circle_filled(cx + 6, cy + 8, 5,
                                  imgui.get_color_u32_rgba(col[0], col[1], col[2], 1.0))
             imgui.set_cursor_pos_x(imgui.get_cursor_pos()[0] + 16)
-            label = (f"{ant.label}  {ant.amplitude:.2f}  x{ant.frequency:.2f}"
-                     f"  ({int(ant.x)},{int(ant.y)})##row{i}")
-            clicked, _ = imgui.selectable(label, i == self.sel,
-                                          width=PANEL_W - 28)
+            label = (f"{ant.label}  A={ant.amplitude:.2f}  a={ant.a:.2f}"
+                     f"  th={ant.theta_0:.2f}##row{i}")
+            clicked, _ = imgui.selectable(label, i == self.sel, width=PANEL_W - 28)
             if clicked:
                 self.sel = i
 
@@ -547,14 +578,28 @@ class WaveFormApp:
             imgui.text(ant.label)
 
             imgui.push_item_width(PANEL_W - 32)
+
             changed, v = imgui.slider_float("Amplitude##amp", ant.amplitude, 0.0, 1.0)
             if changed:
                 ant.amplitude = v
                 send_antenna(ant)
+
             changed, v = imgui.slider_float("Frequency##freq", ant.frequency, 0.1, 10.0)
             if changed:
                 ant.frequency = v
                 send_antenna(ant)
+
+            changed, v = imgui.slider_float("Direction##theta", ant.theta_0,
+                                            0.0, 6.2832, format="%.2f rad")
+            if changed:
+                ant.theta_0 = v
+                send_antenna(ant)
+
+            changed, v = imgui.slider_float("Directivity##a", ant.a, 0.0, 1.0)
+            if changed:
+                ant.a = v
+                send_antenna(ant)
+
             imgui.pop_item_width()
 
             imgui.text(f"x {int(ant.x):>3}  y {int(ant.y):>3}")
@@ -582,7 +627,7 @@ class WaveFormApp:
         # Footer
         imgui.set_cursor_pos((imgui.get_cursor_pos()[0], WINDOW_H - 20))
         imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
-        imgui.text("Tab: cycle   Del: remove")
+        imgui.text("Tab: cycle   Space: pause   Del: remove")
         imgui.pop_style_color()
 
         imgui.end()

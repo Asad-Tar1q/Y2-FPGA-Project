@@ -1,7 +1,7 @@
 """
 WaveForm — Simulated PYNQ-Z1 FPGA backend.
 Run:  python pynq_sim.py
-Port 5001 — receives 16-byte antenna control structs from client.
+Port 5001 — receives 20-byte antenna control structs from client.
 Port 5000 — streams uint8 frames (4-byte big-endian length header) to client.
 """
 
@@ -18,16 +18,20 @@ CTRL_PORT   = 5001
 FIELD_W     = 640
 FIELD_H     = 480
 FRAME_BYTES = FIELD_W * FIELD_H
-CTRL_FMT    = ">BBHHff2x"
-CTRL_SIZE   = struct.calcsize(CTRL_FMT)   # 16 bytes
+CTRL_FMT    = ">BBHHffff"
+CTRL_SIZE   = struct.calcsize(CTRL_FMT)   # 20 bytes
 
 TARGET_FPS  = 30.0
 
-# ── Shared antenna state ───────────────────────────────────────────────────────
-_ant_lock = threading.Lock()
+# ── Shared state (all guarded by _ant_lock) ────────────────────────────────────
+_ant_lock    = threading.Lock()
 _antennas: dict = {
-    0: {"id": 0, "x": 320, "y": 240, "amplitude": 0.75, "frequency": 1.0}
+    0: {"id": 0, "x": 320, "y": 240, "amplitude": 0.75, "frequency": 1.0,
+        "theta_0": 0.0, "a": 0.0}
 }
+_sim_time    = 0.0
+_last_real_t = time.monotonic()
+_paused      = False
 
 # Pre-compute coordinate grids (reused every frame)
 _xs = np.arange(FIELD_W, dtype=np.float32)
@@ -37,6 +41,7 @@ _XX, _YY = np.meshgrid(_xs, _ys)
 
 # ── Control server — port 5001 ─────────────────────────────────────────────────
 def _handle_ctrl(conn, addr):
+    global _paused
     print(f"[ctrl] connected {addr}")
     buf = b""
     try:
@@ -48,23 +53,32 @@ def _handle_ctrl(conn, addr):
             while len(buf) >= CTRL_SIZE:
                 raw = buf[:CTRL_SIZE]
                 buf = buf[CTRL_SIZE:]
-                ant_id, cmd, x, y, amplitude, frequency = struct.unpack(CTRL_FMT, raw)
+                ant_id, cmd, x, y, amplitude, frequency, theta_0, a = \
+                    struct.unpack(CTRL_FMT, raw)
                 if cmd == 1:
                     with _ant_lock:
                         _antennas.pop(ant_id, None)
                     print(f"  [PL] delete antenna {ant_id}")
+                elif cmd == 2:
+                    with _ant_lock:
+                        _paused = not _paused
+                    print(f"  [PL] simulation {'paused' if _paused else 'resumed'}")
                 else:
+                    amplitude = max(0.0, min(1.0, float(amplitude)))
+                    a         = max(0.0, min(1.0, float(a)))
                     with _ant_lock:
                         _antennas[ant_id] = {
                             "id":        ant_id,
                             "x":         int(x),
                             "y":         int(y),
-                            "amplitude": float(amplitude),
+                            "amplitude": amplitude,
                             "frequency": float(frequency),
+                            "theta_0":   float(theta_0),
+                            "a":         a,
                         }
                     print(f"  [PL] antenna {ant_id}: "
-                          f"amp={amplitude:.3f}  "
-                          f"freq=×{frequency:.3f}  "
+                          f"amp={amplitude:.3f}  freq=×{frequency:.3f}  "
+                          f"θ={theta_0:.3f}  a={a:.3f}  "
                           f"pos=({int(x)},{int(y)})")
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
@@ -86,21 +100,32 @@ def _ctrl_server():
 
 # ── Frame generator ────────────────────────────────────────────────────────────
 def _generate_frame() -> np.ndarray:
+    global _sim_time, _last_real_t
     with _ant_lock:
         ants = list(_antennas.values())
+        now  = time.monotonic()
+        if not _paused:
+            _sim_time += now - _last_real_t
+        _last_real_t = now
+        t = _sim_time
 
-    t     = time.monotonic()
     field = np.zeros((FIELD_H, FIELD_W), dtype=np.float32)
 
-    for a in ants:
-        cx   = float(a["x"])
-        cy   = float(a["y"])
-        amp  = float(a.get("amplitude", 0.75))
-        freq = float(a.get("frequency", 1.0))
-        r    = np.hypot(_XX - cx, _YY - cy)
-        # Decaying sinusoidal ring: amplitude envelope / (r/scale + 1)
-        field += amp * np.cos(2.0 * np.pi * freq * r / 80.0 - t * 3.0) \
-                     / (r / 40.0 + 1.0)
+    for a_dict in ants:
+        cx      = float(a_dict["x"])
+        cy      = float(a_dict["y"])
+        amp     = float(a_dict.get("amplitude", 0.75))
+        freq    = float(a_dict.get("frequency", 1.0))
+        theta_0 = float(a_dict.get("theta_0", 0.0))
+        a       = float(a_dict.get("a", 0.0))
+
+        dx    = _XX - cx
+        dy    = _YY - cy
+        r     = np.hypot(dx, dy)
+        theta = np.arctan2(dy, dx)
+        D     = (1.0 - a) + a * np.maximum(0.0, np.cos(theta - theta_0)) ** 6
+        field += amp * D * np.cos(2.0 * np.pi * freq * r / 80.0 - t * 3.0) \
+                         / (r / 40.0 + 1.0)
 
     lo, hi = field.min(), field.max()
     if hi > lo:
