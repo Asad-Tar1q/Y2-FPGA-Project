@@ -3,10 +3,13 @@ WaveForm — EM Field Renderer client (ModernGL + pyimgui).
 Run:  python client.py
 """
 
-# Must be set before any OpenGL import — tells PyOpenGL to use GLX for
-# context detection (GLFW on WSL2/Mesa uses GLX)
 import os
-os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+import sys
+
+# On Linux (including WSL2) PyOpenGL defaults to GLX for context detection,
+# which is correct. macOS uses CGL and Windows uses WGL — don't override those.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
 
 import time
 import math
@@ -21,13 +24,12 @@ import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib
 
-# ── Dimensions ─────────────────────────────────────────────────────────────────
-WINDOW_W    = 920
-WINDOW_H    = 480
-FIELD_W     = 640
+# ── Constants ──────────────────────────────────────────────────────────────────
+WINDOW_W    = 920       # initial window width
+WINDOW_H    = 480       # initial window height
+FIELD_W     = 640       # texture / simulation resolution
 FIELD_H     = 480
-PANEL_X     = 640
-PANEL_W     = 280
+PANEL_W     = 280       # sidebar always this wide
 GRID_STEP   = 40
 MAX_SOURCES = 8
 MIN_SEP     = 26
@@ -63,8 +65,8 @@ class Antenna:
         self.y         = float(y)
         self.amplitude = float(amplitude)
         self.frequency = float(frequency)
-        self.theta_0   = 0.0   # antenna direction, radians [0, 2π]
-        self.a         = 0.0   # directionality: 0=isotropic, 1=log-periodic
+        self.theta_0   = 0.0
+        self.a         = 0.0
 
     @property
     def colour(self):
@@ -232,25 +234,6 @@ void main() {
 """
 
 
-# ── Coordinate helpers ──────────────────────────────────────────────────────────
-def px_to_ndc_x(px):
-    return px / WINDOW_W * 2.0 - 1.0
-
-def px_to_ndc_y(py):
-    return 1.0 - py / WINDOW_H * 2.0
-
-def field_px_to_ndc(fx, fy):
-    return px_to_ndc_x(fx), px_to_ndc_y(fy)
-
-def _quad_verts(cx, cy, rx, ry):
-    l, r = cx - rx, cx + rx
-    b, t = cy - ry, cy + ry
-    return np.array([
-        l, b,  r, b,  l, t,
-        r, b,  r, t,  l, t,
-    ], dtype='f4').tobytes()
-
-
 # ── Application ────────────────────────────────────────────────────────────────
 class WaveFormApp:
     def __init__(self):
@@ -276,6 +259,9 @@ class WaveFormApp:
         imgui.create_context()
         self.impl = GlfwRenderer(self.window)
 
+        # Track current framebuffer dimensions (updated on resize)
+        self.win_w, self.win_h = glfw.get_framebuffer_size(self.window)
+
         self._setup_gl()
         self._setup_callbacks()
 
@@ -286,6 +272,25 @@ class WaveFormApp:
         self._disp_fps    = 0.0
         self._disp_n      = 0
         self._disp_t      = time.monotonic()
+
+    # ── Coordinate helpers (depend on current window size) ─────────────────────
+    def _field_w(self):
+        """Pixel width of the field region (window minus panel)."""
+        return max(1, self.win_w - PANEL_W)
+
+    def _field_to_ndc(self, fx, fy):
+        """Map field pixel coords [0,FIELD_W]×[0,FIELD_H] → NDC."""
+        fw = self._field_w()
+        nx = fx / FIELD_W * (fw / self.win_w * 2.0) - 1.0
+        ny = 1.0 - fy / FIELD_H * 2.0
+        return nx, ny
+
+    def _screen_to_field(self, sx, sy):
+        """Map screen pixel coords → field pixel coords."""
+        fw = self._field_w()
+        fx = sx / fw * FIELD_W
+        fy = sy / self.win_h * FIELD_H
+        return fx, fy
 
     # ── GL setup ───────────────────────────────────────────────────────────────
     def _setup_gl(self):
@@ -305,65 +310,88 @@ class WaveFormApp:
         self.field_prog['field']   = 0
         self.field_prog['viridis'] = 1
 
-        rx = px_to_ndc_x(FIELD_W)
-        # Interleaved pos(x,y) + uv(u,v). UV flips Y so numpy row-0 (image top)
-        # maps to screen top.
-        quad_data = np.array([
-            # pos_x  pos_y   uv_u  uv_v
-            -1.0,   -1.0,   0.0,  1.0,
-             rx,    -1.0,   1.0,  1.0,
-            -1.0,    1.0,   0.0,  0.0,
-             rx,    -1.0,   1.0,  1.0,
-             rx,     1.0,   1.0,  0.0,
-            -1.0,    1.0,   0.0,  0.0,
-        ], dtype='f4')
-        self.field_vbo = ctx.buffer(quad_data.tobytes())
+        # Field quad — 6 vertices, pos(x,y) + uv(u,v), updated on resize
+        self.field_vbo = ctx.buffer(reserve=6 * 4 * 4)
         self.field_vao = ctx.vertex_array(
             self.field_prog, [(self.field_vbo, '2f 2f', 'in_vert', 'in_uv')])
 
         self.col_prog = ctx.program(
             vertex_shader=_COLOUR_VERT, fragment_shader=_COLOUR_FRAG)
 
-        self._build_grid()
+        # Grid — fixed line count, contents updated on resize
+        n_vert_lines = FIELD_W // GRID_STEP + 1
+        n_horiz_lines = FIELD_H // GRID_STEP + 1
+        self._grid_count = (n_vert_lines + n_horiz_lines) * 2
+        self.grid_vbo = ctx.buffer(reserve=self._grid_count * 2 * 4)
+        self.grid_vao = ctx.vertex_array(
+            self.col_prog, [(self.grid_vbo, '2f', 'in_vert')])
 
         self.dot_vbo = ctx.buffer(reserve=48)
         self.dot_vao = ctx.vertex_array(
             self.col_prog, [(self.dot_vbo, '2f', 'in_vert')])
 
-    def _build_grid(self):
+        # Write initial geometry
+        self._rebuild_geometry()
+
+    def _rebuild_geometry(self):
+        """Recompute field quad and grid NDC coords for the current window size."""
+        fw = self._field_w()
+        rx = fw / self.win_w * 2.0 - 1.0   # NDC x at right edge of field
+
+        # Field quad: pos + UV, UV flips Y so numpy row-0 maps to screen top
+        quad_data = np.array([
+            -1.0, -1.0,  0.0, 1.0,
+             rx,  -1.0,  1.0, 1.0,
+            -1.0,  1.0,  0.0, 0.0,
+             rx,  -1.0,  1.0, 1.0,
+             rx,   1.0,  1.0, 0.0,
+            -1.0,  1.0,  0.0, 0.0,
+        ], dtype='f4')
+        self.field_vbo.write(quad_data.tobytes())
+
+        # Grid lines
         lines = []
-        rx = px_to_ndc_x(FIELD_W)
         for col in range(0, FIELD_W + 1, GRID_STEP):
-            nx = px_to_ndc_x(col)
+            nx = col / FIELD_W * (rx + 1.0) - 1.0
             lines += [nx, -1.0, nx, 1.0]
         for row in range(0, FIELD_H + 1, GRID_STEP):
-            ny = px_to_ndc_y(row)
+            ny = 1.0 - row / FIELD_H * 2.0
             lines += [-1.0, ny, rx, ny]
-        self.grid_vbo = self.ctx.buffer(np.array(lines, dtype='f4').tobytes())
-        self.grid_vao = self.ctx.vertex_array(
-            self.col_prog, [(self.grid_vbo, '2f', 'in_vert')])
+        self.grid_vbo.write(np.array(lines, dtype='f4').tobytes())
         self._grid_count = len(lines) // 2
+
+        # Update GL viewport
+        self.ctx.viewport = (0, 0, self.win_w, self.win_h)
 
     # ── GLFW callbacks ─────────────────────────────────────────────────────────
     def _setup_callbacks(self):
-        glfw.set_mouse_button_callback(self.window, self._mouse_button_cb)
-        glfw.set_cursor_pos_callback(self.window,   self._cursor_pos_cb)
-        glfw.set_key_callback(self.window,          self._key_cb)
+        glfw.set_mouse_button_callback(self.window,      self._mouse_button_cb)
+        glfw.set_cursor_pos_callback(self.window,        self._cursor_pos_cb)
+        glfw.set_key_callback(self.window,               self._key_cb)
+        glfw.set_framebuffer_size_callback(self.window,  self._on_resize)
+
+    def _on_resize(self, win, w, h):
+        if w <= 0 or h <= 0:
+            return
+        self.win_w, self.win_h = w, h
+        self._rebuild_geometry()
 
     def _mouse_button_cb(self, win, button, action, mods):
         if imgui.get_io().want_capture_mouse:
             return
-        x, y = glfw.get_cursor_pos(win)
-        if button == glfw.MOUSE_BUTTON_LEFT and x < FIELD_W:
+        sx, sy = glfw.get_cursor_pos(win)
+        fw = self._field_w()
+        if button == glfw.MOUSE_BUTTON_LEFT and sx < fw:
+            fx, fy = self._screen_to_field(sx, sy)
             if action == glfw.PRESS:
-                hit = self._ant_at(x, y)
+                hit = self._ant_at(fx, fy)
                 if hit is not None:
                     self.sel       = hit
                     self._drag_ant = hit
                 elif self.antennas:
                     ant = self.antennas[self.sel]
-                    nx = float(max(0, min(FIELD_W - 1, x)))
-                    ny = float(max(0, min(FIELD_H - 1, y)))
+                    nx = float(max(0, min(FIELD_W - 1, fx)))
+                    ny = float(max(0, min(FIELD_H - 1, fy)))
                     if not self._overlaps_any(nx, ny, self.sel):
                         ant.x, ant.y = nx, ny
                         send_antenna(ant, force=True)
@@ -372,11 +400,12 @@ class WaveFormApp:
                     send_antenna(self.antennas[self._drag_ant], force=True)
                 self._drag_ant = None
 
-    def _cursor_pos_cb(self, win, x, y):
-        if self._drag_ant is not None and x < FIELD_W:
+    def _cursor_pos_cb(self, win, sx, sy):
+        if self._drag_ant is not None and sx < self._field_w():
             a  = self.antennas[self._drag_ant]
-            nx = float(max(0, min(FIELD_W - 1, x)))
-            ny = float(max(0, min(FIELD_H - 1, y)))
+            fx, fy = self._screen_to_field(sx, sy)
+            nx = float(max(0, min(FIELD_W - 1, fx)))
+            ny = float(max(0, min(FIELD_H - 1, fy)))
             if not self._overlaps_any(nx, ny, self._drag_ant):
                 a.x, a.y = nx, ny
             now = time.monotonic()
@@ -389,7 +418,9 @@ class WaveFormApp:
         if imgui.get_io().want_capture_keyboard:
             return
         if action == glfw.PRESS:
-            if key == glfw.KEY_SPACE:
+            if key == glfw.KEY_F11:
+                self._toggle_fullscreen()
+            elif key == glfw.KEY_SPACE:
                 _paused = not _paused
                 send_pause_toggle()
             elif key == glfw.KEY_TAB and self.antennas:
@@ -397,10 +428,22 @@ class WaveFormApp:
             elif key == glfw.KEY_DELETE:
                 self._del_ant()
 
+    def _toggle_fullscreen(self):
+        if glfw.get_window_monitor(self.window):
+            glfw.set_window_monitor(self.window, None,
+                                    100, 100, WINDOW_W, WINDOW_H, 0)
+        else:
+            monitor = glfw.get_primary_monitor()
+            mode    = glfw.get_video_mode(monitor)
+            glfw.set_window_monitor(self.window, monitor, 0, 0,
+                                    mode.size.width, mode.size.height,
+                                    mode.refresh_rate)
+
     # ── Antenna helpers ────────────────────────────────────────────────────────
-    def _ant_at(self, mx, my):
+    def _ant_at(self, fx, fy):
+        """Hit-test against field pixel coords."""
         for i, a in enumerate(self.antennas):
-            if (mx - a.x) ** 2 + (my - a.y) ** 2 <= 144:
+            if (fx - a.x) ** 2 + (fy - a.y) ** 2 <= 144:
                 return i
         return None
 
@@ -464,22 +507,25 @@ class WaveFormApp:
     def _draw_dots(self):
         if not self.antennas:
             return
-        r   = 10.0 / WINDOW_W * 2.0
-        ry  = 10.0 / WINDOW_H * 2.0
-        sr  = 14.0 / WINDOW_W * 2.0
-        sry = 14.0 / WINDOW_H * 2.0
+        # Dot radii in NDC — scale with window so dots stay roughly same screen size
+        r_px  = 10.0
+        sr_px = 14.0
+        r_nx  = r_px  / self.win_w * 2.0
+        r_ny  = r_px  / self.win_h * 2.0
+        sr_nx = sr_px / self.win_w * 2.0
+        sr_ny = sr_px / self.win_h * 2.0
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
         for i, ant in enumerate(self.antennas):
-            cx, cy = field_px_to_ndc(ant.x, ant.y)
+            cx, cy = self._field_to_ndc(ant.x, ant.y)
             if i == self.sel:
-                self.dot_vbo.write(_quad_verts(cx, cy, sr, sry))
+                self.dot_vbo.write(_quad_verts(cx, cy, sr_nx, sr_ny))
                 self.col_prog['u_colour'].value = (1.0, 1.0, 1.0, 1.0)
                 self.dot_vao.render(moderngl.TRIANGLES, vertices=6)
             col = ant.colour
-            self.dot_vbo.write(_quad_verts(cx, cy, r, ry))
+            self.dot_vbo.write(_quad_verts(cx, cy, r_nx, r_ny))
             self.col_prog['u_colour'].value = (col[0], col[1], col[2], 1.0)
             self.dot_vao.render(moderngl.TRIANGLES, vertices=6)
 
@@ -488,6 +534,8 @@ class WaveFormApp:
     # ── ImGui panel ────────────────────────────────────────────────────────────
     def _draw_panel(self):
         global _paused
+        panel_x = self.win_w - PANEL_W
+
         imgui.push_style_color(imgui.COLOR_WINDOW_BACKGROUND,  0.059, 0.125, 0.208, 1.0)
         imgui.push_style_color(imgui.COLOR_TEXT,               0.847, 0.906, 0.969, 1.0)
         imgui.push_style_color(imgui.COLOR_FRAME_BACKGROUND,   0.043, 0.098, 0.161, 1.0)
@@ -507,8 +555,8 @@ class WaveFormApp:
                  imgui.WINDOW_NO_MOVE       |
                  imgui.WINDOW_NO_SAVED_SETTINGS)
 
-        imgui.set_next_window_position(PANEL_X, 0)
-        imgui.set_next_window_size(PANEL_W, WINDOW_H)
+        imgui.set_next_window_position(panel_x, 0)
+        imgui.set_next_window_size(PANEL_W, self.win_h)
         imgui.begin("##panel", flags=flags)
 
         # Header
@@ -522,12 +570,12 @@ class WaveFormApp:
 
         imgui.separator()
 
-        # Pause / Resume button
-        pause_label = "|| Pause" if not _paused else ">  Resume"
+        # Pause / Resume
         p_col = (0.863, 0.275, 0.275, 1.0) if not _paused else (0.275, 0.784, 0.275, 1.0)
         imgui.push_style_color(imgui.COLOR_TEXT,           *p_col)
         imgui.push_style_color(imgui.COLOR_BUTTON,         0.043, 0.098, 0.161, 1.0)
         imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, p_col[0], p_col[1], p_col[2], 0.3)
+        pause_label = "|| Pause" if not _paused else ">  Resume"
         if imgui.button(pause_label, width=PANEL_W - 16):
             _paused = not _paused
             send_pause_toggle()
@@ -624,10 +672,10 @@ class WaveFormApp:
             imgui.text("drag on field")
             imgui.pop_style_color()
 
-        # Footer
-        imgui.set_cursor_pos((imgui.get_cursor_pos()[0], WINDOW_H - 20))
+        # Footer — pinned to bottom of panel
+        imgui.set_cursor_pos((imgui.get_cursor_pos()[0], self.win_h - 20))
         imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
-        imgui.text("Tab: cycle   Space: pause   Del: remove")
+        imgui.text("Tab  Space  Del  F11")
         imgui.pop_style_color()
 
         imgui.end()
@@ -671,6 +719,15 @@ class WaveFormApp:
 
         self.impl.shutdown()
         glfw.terminate()
+
+
+def _quad_verts(cx, cy, rx, ry):
+    l, r = cx - rx, cx + rx
+    b, t = cy - ry, cy + ry
+    return np.array([
+        l, b,  r, b,  l, t,
+        r, b,  r, t,  l, t,
+    ], dtype='f4').tobytes()
 
 
 if __name__ == "__main__":
