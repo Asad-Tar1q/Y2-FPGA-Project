@@ -1,5 +1,6 @@
 import socket
 import struct
+import threading
 import time
 import numpy as np
 from pynq import Overlay, allocate
@@ -30,8 +31,8 @@ def main() -> None:
     print(f"Listening on {HOST}:{PORT}")
 
     while True:
-        conn, addr = server.accept()
-        print(f"Client connected: {addr}")
+        conn, addr = srv.accept()
+        threading.Thread(target=_handle_frame, args=(conn, addr), daemon=True).start()
 
         frames_sent = 0
         fps_timer   = time.monotonic()
