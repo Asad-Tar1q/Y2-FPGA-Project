@@ -1,7 +1,10 @@
 """
 WaveForm — EM Field Renderer client.
 Run:  python client.py
-Connects to pynq_sim.py on localhost. Falls back to demo mode if unavailable.
+Connects to fpga_sim.py on localhost. Falls back to demo mode if unavailable.
+
+Protocol: sends 37-byte bit-packed snapshots on port 5001 at 30 Hz.
+All values are quantised to integers before packing — no floats on wire.
 """
 
 import sys
@@ -12,8 +15,12 @@ import struct
 import math
 
 import pygame
-import pygame.freetype
 import numpy as np
+
+from waveform_protocol import (
+    pack_packet, PACKET_BYTES, N_SOURCES,
+    q_direction   # for direction slider snap display
+)
 
 # ── Dimensions ─────────────────────────────────────────────────────────────────
 WINDOW_W    = 920
@@ -23,16 +30,14 @@ FIELD_H     = 480
 PANEL_X     = 640
 PANEL_W     = 280
 GRID_STEP   = 40
-MAX_SOURCES = 5
-MAX_VIS     = 6       # max source-list rows before scrolling
-MIN_SEP     = 26      # minimum center-to-center px between sources
+MAX_SOURCES = N_SOURCES
+MAX_VIS     = 5
+MIN_SEP     = 26
 
 # ── Network ───────────────────────────────────────────────────────────────────
 HOST       = "127.0.0.1"
 FRAME_PORT = 5000
 CTRL_PORT  = 5001
-CTRL_FMT   = ">BBHHff2x"
-CTRL_SIZE  = struct.calcsize(CTRL_FMT)   # 16 bytes
 SEND_HZ    = 30
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
@@ -51,8 +56,7 @@ C_AMBER     = (239, 159,  39)
 SOURCE_COLS = [
     C_CYAN, C_AMBER,
     (220, 100, 220), (100, 220, 100),
-    (220, 220, 100), (100, 180, 220),
-    (220, 140, 100), (160, 100, 220),
+    (220, 220, 100),
 ]
 
 # ── CUDA / NumPy LUT ──────────────────────────────────────────────────────────
@@ -63,43 +67,12 @@ _d_lut      = None
 _gpu_render = None
 
 
-class RenderFont:
-    def __init__(self, font):
-        self._font = font
-
-    def render(self, text, antialias, color):
-        surf, _ = self._font.render(text, fgcolor=color)
-        return surf
-
-    def size(self, text):
-        rect = self._font.get_rect(text)
-        return rect.width, rect.height
-
-    def render_to(self, surf, pos, text, color):
-        self._font.render_to(surf, pos, text, fgcolor=color)
-
-
 def _build_viridis() -> np.ndarray:
-    """Custom RdBu LUT:
-    - negative -> blue (#2166AC)
-    - zero     -> white (#F7F7F7)
-    - positive -> red (#B2182B)
-    """
-    neg = np.array([33, 102, 172], dtype=np.float32)   # #2166AC
-    zero = np.array([247, 247, 247], dtype=np.float32)  # #F7F7F7
-    pos = np.array([178, 24, 43], dtype=np.float32)    # #B2182B
-
-    lut = np.zeros((256, 3), dtype=np.uint8)
-    for i in range(256):
-        t = i / 255.0
-        if t <= 0.5:
-            u = t / 0.5
-            col = (1 - u) * neg + u * zero
-        else:
-            u = (t - 0.5) / 0.5
-            col = (1 - u) * zero + u * pos
-        lut[i] = np.clip(col + 0.5, 0, 255).astype(np.uint8)
-    return lut
+    t = np.linspace(0.0, 1.0, 256)
+    r = np.clip(0.267 + 0.004*t + 2.334*t**2 - 3.567*t**3 + 1.765*t**4, 0, 1)
+    g = np.clip(0.005 + 1.466*t - 0.720*t**2 + 0.222*t**3 - 0.028*t**4, 0, 1)
+    b = np.clip(0.329 + 1.498*t - 4.773*t**2 + 5.282*t**3 - 2.143*t**4, 0, 1)
+    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
 
 
 def _init_lut():
@@ -127,7 +100,6 @@ def _init_lut():
 
 
 def apply_lut(frame: np.ndarray) -> np.ndarray:
-    """uint8 (H,W) → RGB (H,W,3) via viridis LUT."""
     if _cuda_ready:
         try:
             flat    = frame.ravel()
@@ -150,12 +122,14 @@ class Antenna:
     def __init__(self, x: float = FIELD_W / 2, y: float = FIELD_H / 2,
                  amplitude: float = 0.75, frequency: float = 1.0):
         global _next_id
-        self.id        = _next_id
-        _next_id      += 1
-        self.x         = float(x)
-        self.y         = float(y)
-        self.amplitude = float(amplitude)
-        self.frequency = float(frequency)
+        self.id           = _next_id
+        _next_id         += 1
+        self.x            = float(x)
+        self.y            = float(y)
+        self.amplitude    = float(amplitude)
+        self.frequency    = float(frequency)
+        self.dir_strength = 0.0    # 0 = isotropic, 1 = fully directional
+        self.direction    = 0.0    # degrees, snapped to 5° grid on wire
 
     @property
     def colour(self):
@@ -165,6 +139,17 @@ class Antenna:
     def label(self):
         return f"A{self.id + 1}"
 
+    def to_dict(self) -> dict:
+        """Serialise to protocol dict — all values in physical units."""
+        return {
+            "amplitude":    self.amplitude,
+            "frequency":    self.frequency,
+            "dir_strength": self.dir_strength,
+            "direction":    self.direction,
+            "x":            int(self.x),
+            "y":            int(self.y),
+        }
+
 
 # ── Networking ────────────────────────────────────────────────────────────────
 _frame_lock   = threading.Lock()
@@ -173,7 +158,6 @@ _recv_fps     = 0.0
 
 _ctrl_sock    = None
 _ctrl_lock    = threading.Lock()
-_last_send_t  = 0.0
 
 
 def _recv_loop():
@@ -183,11 +167,6 @@ def _recv_loop():
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(3.0)
             s.connect((HOST, FRAME_PORT))
-            # disable Nagle to reduce latency
-            try:
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
             s.settimeout(None)
             print("[client] frame stream connected")
             buf = b""
@@ -207,14 +186,9 @@ def _recv_loop():
                     buf += chunk
                 raw = buf[:length]
                 buf = buf[length:]
-                # If server sends RGB (3 bytes per pixel) store raw bytes, else store grayscale array
-                if length == FIELD_W * FIELD_H * 3:
-                    with _frame_lock:
-                        _latest_frame = raw
-                else:
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(FIELD_H, FIELD_W)
-                    with _frame_lock:
-                        _latest_frame = frame.copy()
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(FIELD_H, FIELD_W)
+                with _frame_lock:
+                    _latest_frame = frame.copy()
                 n += 1
                 now = time.monotonic()
                 if now - t0 >= 1.0:
@@ -241,40 +215,17 @@ def _connect_ctrl() -> bool:
         return False
 
 
-def _raw_send(ant: Antenna):
-    msg = struct.pack(CTRL_FMT,
-                      ant.id & 0xFF, 0,
-                      int(ant.x) & 0xFFFF, int(ant.y) & 0xFFFF,
-                      ant.amplitude, ant.frequency)
+def send_snapshot(antennas: list, global_time: int, seq: int):
+    """
+    Pack all antenna state + global time into a single 37-byte bit-packed
+    packet and send it. This is the only send path — no per-antenna messages.
+    """
+    sources = [a.to_dict() for a in antennas]
+    pkt = pack_packet(seq, global_time, sources)
     with _ctrl_lock:
         if _ctrl_sock:
             try:
-                _ctrl_sock.sendall(msg)
-            except Exception:
-                pass
-
-
-def send_antenna(ant: Antenna, force: bool = False):
-    global _last_send_t
-    now = time.monotonic()
-    if not force and now - _last_send_t < 1.0 / SEND_HZ:
-        return
-    _last_send_t = now
-    _raw_send(ant)
-
-
-def send_all(antennas):
-    for a in antennas:
-        _raw_send(a)
-
-
-def send_delete(ant_id: int):
-    """Signal the sim to remove this antenna (cmd byte = 1)."""
-    msg = struct.pack(CTRL_FMT, ant_id & 0xFF, 1, 0, 0, 0.0, 0.0)
-    with _ctrl_lock:
-        if _ctrl_sock:
-            try:
-                _ctrl_sock.sendall(msg)
+                _ctrl_sock.sendall(pkt)
             except Exception:
                 pass
 
@@ -288,8 +239,8 @@ def draw_grad_text(surf, text, font, x, y, c1, c2):
     total_w = font.size(text)[0]
     cx = x
     for i, ch in enumerate(text):
-        cw = font.size(ch)[0]
-        t  = (cx - x + cw / 2) / max(total_w, 1)
+        cw    = font.size(ch)[0]
+        t     = (cx - x + cw / 2) / max(total_w, 1)
         glyph = font.render(ch, True, lerp_col(c1, c2, t))
         surf.blit(glyph, (cx, y))
         cx += cw
@@ -338,14 +289,13 @@ class Slider:
         return self.rect.x + int(t * self.rect.w)
 
     def _set_from_x(self, px: int):
-        t = (px - self.rect.x) / max(self.rect.w, 1)
+        t          = (px - self.rect.x) / max(self.rect.w, 1)
         self.value = max(self.vmin, min(self.vmax,
                          self.vmin + t * (self.vmax - self.vmin)))
 
     def handle(self, ev) -> bool:
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            hit = self.rect.inflate(0, 20).collidepoint(ev.pos)
-            if hit:
+            if self.rect.inflate(0, 20).collidepoint(ev.pos):
                 self.dragging = True
                 self._set_from_x(ev.pos[0])
                 return True
@@ -361,18 +311,14 @@ class Slider:
     def draw(self, surf, font):
         r  = self.rect
         tx = self._thumb_x()
-        # Track
         pygame.draw.rect(surf, C_BORDER,
                          (r.x, r.centery - 2, r.w, 4), border_radius=2)
-        # Fill
         fw = max(0, tx - r.x)
         if fw:
             pygame.draw.rect(surf, self.fill_col,
                              (r.x, r.centery - 2, fw, 4), border_radius=2)
-        # Thumb
         pygame.draw.circle(surf, C_WHITE,  (tx, r.centery), 7)
         pygame.draw.circle(surf, C_BORDER, (tx, r.centery), 7, 1)
-        # Labels above track
         lbl = font.render(self.label, True, C_SEC)
         surf.blit(lbl, (r.x, r.y - 13))
         val = font.render(self.fmt(self.value), True, C_WHITE)
@@ -384,79 +330,69 @@ class WaveFormApp:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode(
-            (WINDOW_W, WINDOW_H), pygame.RESIZABLE | pygame.SCALED)
+            (WINDOW_W, WINDOW_H), pygame.SCALED | pygame.RESIZABLE)
         pygame.display.set_caption("WaveForm — EM Field Renderer")
-        self.clock  = pygame.time.Clock()
+        self.clock = pygame.time.Clock()
 
-        self.font_title = RenderFont(pygame.freetype.SysFont("Courier New", 20, bold=True))
-        self.font_md    = RenderFont(pygame.freetype.SysFont("Courier New", 14, bold=True))
-        self.font_sm    = RenderFont(pygame.freetype.SysFont("Courier New", 11))
-
-        # Pre-render static field background and grid overlay for faster blits
-        self._field_bg = pygame.Surface((FIELD_W, FIELD_H))
-        self._field_bg.fill(C_BG)
-
-        self._field_grid = pygame.Surface((FIELD_W, FIELD_H), pygame.SRCALPHA)
-        grid_color = (255, 255, 255, 120)  # white lines with slight transparency
-        for x in range(0, FIELD_W + 1, GRID_STEP):
-            pygame.draw.line(self._field_grid, grid_color, (x, 0), (x, FIELD_H))
-        for y in range(0, FIELD_H + 1, GRID_STEP):
-            pygame.draw.line(self._field_grid, grid_color, (0, y), (FIELD_W, y))
-        try:
-            self._field_bg = self._field_bg.convert()
-            self._field_grid = self._field_grid.convert_alpha()
-        except Exception:
-            pass
+        self.font_title = pygame.font.SysFont("Courier New", 20, bold=True)
+        self.font_md    = pygame.font.SysFont("Courier New", 14, bold=True)
+        self.font_sm    = pygame.font.SysFont("Courier New", 11)
 
         self.antennas: list[Antenna] = [Antenna()]
-        self.sel         = 0
-        self._list_off   = 0      # scroll offset for source list
+        self.sel       = 0
+        self._list_off = 0
 
-        # Persistent slider objects — rects updated each draw
-        self._amp_sl  = Slider(0.0, 1.0,   0.75, C_CYAN,
-                               "Amplitude",     lambda v: f"{v:.2f}")
-        self._freq_sl = Slider(0.1, 10.0,  1.0,  C_CYAN,
-                               "Frequency (×)", lambda v: f"×{v:.2f}")
+        # ── Protocol state ────────────────────────────────────────────────────
+        self._global_time  = 0     # 0-8192, incremented per send
+        self._send_seq     = 0     # 0-65535, wrapping
+        self._last_send_t  = 0.0
+
+        # ── Sliders — 4 per antenna ───────────────────────────────────────────
+        self._amp_sl  = Slider(0.0,   1.0,   0.75, C_CYAN,
+                               "Amplitude",       lambda v: f"{v:.2f}")
+        self._freq_sl = Slider(0.1,  10.0,   1.0,  C_AMBER,
+                               "Frequency (×)",   lambda v: f"×{v:.2f}")
+        self._dstr_sl = Slider(0.0,   1.0,   0.0,  C_MINT,
+                               "Dir Strength",    lambda v: f"{v:.2f}")
+        self._dir_sl  = Slider(0.0, 355.0,   0.0,  C_LAVENDER,
+                               "Direction (°)",
+                               lambda v: f"{q_direction(v)*5:>3}°")
         self._sync_sliders()
 
-        # Interaction state
-        self._drag_ant      = None
-        self._last_drag_t   = 0.0
+        # ── Interaction state ─────────────────────────────────────────────────
+        self._drag_ant    = None
+        self._last_drag_t = 0.0
 
-        # Layout rects (set during draw, read during events)
+        # Layout rects (populated during draw)
         self._row_rects: list[pygame.Rect] = []
         self._add_rect  = pygame.Rect(0, 0, 0, 0)
         self._del_rect  = pygame.Rect(0, 0, 0, 0)
 
         # FPS tracking
-        self._disp_fps    = 0.0
-        self._disp_n      = 0
-        self._disp_t      = time.monotonic()
+        self._disp_fps = 0.0
+        self._disp_n   = 0
+        self._disp_t   = time.monotonic()
 
-    # ── Sync helpers ───────────────────────────────────────────────────────────
-    def _source_label(self, index: int) -> str:
-        return f"A{index + 1}"
-
-    def _source_colour(self, index: int):
-        return SOURCE_COLS[index % len(SOURCE_COLS)]
-
+    # ── Sync helpers ──────────────────────────────────────────────────────────
     def _sync_sliders(self):
         if not self.antennas:
-            self._amp_sl.dragging  = False
-            self._freq_sl.dragging = False
+            for sl in (self._amp_sl, self._freq_sl, self._dstr_sl, self._dir_sl):
+                sl.dragging = False
             return
         a = self.antennas[self.sel]
-        self._amp_sl.value     = a.amplitude
-        self._amp_sl.fill_col  = self._source_colour(self.sel)
-        self._freq_sl.value    = a.frequency
-        self._amp_sl.dragging  = False
-        self._freq_sl.dragging = False
+        self._amp_sl.value  = a.amplitude
+        self._amp_sl.fill_col = a.colour
+        self._freq_sl.value = a.frequency
+        self._dstr_sl.value = a.dir_strength
+        self._dir_sl.value  = a.direction
+        for sl in (self._amp_sl, self._freq_sl, self._dstr_sl, self._dir_sl):
+            sl.dragging = False
 
     def _clamp_scroll(self):
         if not self.antennas:
             self._list_off = 0
             return
-        n = len(self.antennas)
+        n       = len(self.antennas)
         max_off = max(0, n - MAX_VIS)
         self._list_off = max(0, min(self._list_off, max_off))
         if self.sel < self._list_off:
@@ -492,7 +428,9 @@ class WaveFormApp:
         _init_lut()
         threading.Thread(target=_recv_loop, daemon=True).start()
         _connect_ctrl()
-        send_all(self.antennas)
+        # Send initial state immediately
+        send_snapshot(self.antennas, self._global_time, self._send_seq)
+        self._send_seq = (self._send_seq + 1) & 0xFFFF
 
         while True:
             self.clock.tick(60)
@@ -501,6 +439,13 @@ class WaveFormApp:
             if now - self._disp_t >= 1.0:
                 self._disp_fps = self._disp_n / (now - self._disp_t)
                 self._disp_n, self._disp_t = 0, now
+
+            # ── Snapshot send at SEND_HZ ──────────────────────────────────────
+            if now - self._last_send_t >= 1.0 / SEND_HZ:
+                send_snapshot(self.antennas, self._global_time, self._send_seq)
+                self._send_seq    = (self._send_seq + 1) & 0xFFFF
+                self._global_time = (self._global_time + 1) % 8193  # wraps 0-8192
+                self._last_send_t = now
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
@@ -511,19 +456,25 @@ class WaveFormApp:
             self._draw()
             pygame.display.flip()
 
-    # ── Event handling ─────────────────────────────────────────────────────────
+    # ── Event handling ────────────────────────────────────────────────────────
     def _handle(self, ev):
         ant = self.antennas[self.sel] if self.antennas else None
 
-        # Sliders take priority (only when a source is selected)
-        if ant and self._amp_sl.handle(ev):
-            ant.amplitude = self._amp_sl.value
-            send_antenna(ant)
-            return
-        if ant and self._freq_sl.handle(ev):
-            ant.frequency = self._freq_sl.value
-            send_antenna(ant)
-            return
+        # All four sliders — any change marks the antenna dirty
+        # (next snapshot send will pick it up automatically)
+        if ant:
+            if self._amp_sl.handle(ev):
+                ant.amplitude = self._amp_sl.value
+                return
+            if self._freq_sl.handle(ev):
+                ant.frequency = self._freq_sl.value
+                return
+            if self._dstr_sl.handle(ev):
+                ant.dir_strength = self._dstr_sl.value
+                return
+            if self._dir_sl.handle(ev):
+                ant.direction = self._dir_sl.value
+                return
 
         if ev.type == pygame.KEYDOWN:
             if ev.key == pygame.K_F11:
@@ -535,7 +486,7 @@ class WaveFormApp:
             elif ev.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
                 self._del_ant()
 
-        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             mx, my = ev.pos
             if mx < FIELD_W:
                 self._field_click(mx, my)
@@ -543,41 +494,33 @@ class WaveFormApp:
                 self._panel_click(mx, my)
 
         elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-            if self._drag_ant is not None:
-                send_antenna(self.antennas[self._drag_ant], force=True)
             self._drag_ant = None
 
         elif ev.type == pygame.MOUSEMOTION and self._drag_ant is not None:
             mx, my = ev.pos
-            a  = self.antennas[self._drag_ant]
-            nx = float(max(0, min(FIELD_W - 1, mx)))
-            ny = float(max(0, min(FIELD_H - 1, my)))
+            a      = self.antennas[self._drag_ant]
+            nx     = float(max(0, min(FIELD_W - 1, mx)))
+            ny     = float(max(0, min(FIELD_H - 1, my)))
             if not self._overlaps_any(nx, ny, self._drag_ant):
                 a.x, a.y = nx, ny
-            now = time.monotonic()
-            if now - self._last_drag_t >= 1.0 / SEND_HZ:
-                send_antenna(a)
-                self._last_drag_t = now
 
     def _ant_at(self, mx, my) -> int | None:
         for i, a in enumerate(self.antennas):
-            if (mx - a.x) ** 2 + (my - a.y) ** 2 <= 144:   # r = 12
+            if (mx - a.x) ** 2 + (my - a.y) ** 2 <= 144:
                 return i
         return None
 
     def _field_click(self, mx, my):
         hit = self._ant_at(mx, my)
         if hit is not None:
-            self.sel = hit
+            self.sel       = hit
+            self._drag_ant = hit
             self._clamp_scroll()
             self._sync_sliders()
-            self._drag_ant = hit
         elif self.antennas:
-            # Teleport only if destination is free
             if not self._overlaps_any(float(mx), float(my), self.sel):
-                ant = self.antennas[self.sel]
+                ant      = self.antennas[self.sel]
                 ant.x, ant.y = float(mx), float(my)
-                send_antenna(ant, force=True)
 
     def _panel_click(self, mx, my):
         if self._add_rect.collidepoint(mx, my):
@@ -596,18 +539,15 @@ class WaveFormApp:
         if len(self.antennas) >= MAX_SOURCES:
             return
         x, y = self._find_free_pos()
-        a = Antenna(x, y)
+        a    = Antenna(x, y)
         self.antennas.append(a)
         self.sel = len(self.antennas) - 1
         self._clamp_scroll()
         self._sync_sliders()
-        send_antenna(a, force=True)
 
     def _del_ant(self):
         if not self.antennas:
             return
-        ant = self.antennas[self.sel]
-        send_delete(ant.id)          # tell sim to remove this antenna
         del self.antennas[self.sel]
         if self.antennas:
             self.sel = min(self.sel, len(self.antennas) - 1)
@@ -616,50 +556,41 @@ class WaveFormApp:
         self._clamp_scroll()
         self._sync_sliders()
 
-    # ── Drawing ────────────────────────────────────────────────────────────────
+    # ── Drawing ───────────────────────────────────────────────────────────────
     def _draw(self):
         self.screen.fill(C_BG)
-        self._draw_field(self.screen)
-        self._draw_panel(self.screen)
+        self._draw_field()
+        self._draw_panel()
 
-    # ── Field ──────────────────────────────────────────────────────────────────
-    def _draw_field(self, s):
+    def _draw_field(self):
+        s = self.screen
+        for x in range(0, FIELD_W + 1, GRID_STEP):
+            pygame.draw.line(s, C_BORDER, (x, 0), (x, FIELD_H))
+        for y in range(0, FIELD_H + 1, GRID_STEP):
+            pygame.draw.line(s, C_BORDER, (0, y), (FIELD_W, y))
 
-        # Grid (pre-rendered)
-        s.blit(self._field_bg, (0, 0))
-
-        # Frame overlay
         with _frame_lock:
             frame = _latest_frame
         if frame is not None:
-            # if frame is raw RGB bytes (3 bytes per pixel) we can blit directly
-            if isinstance(frame, (bytes, bytearray)) and len(frame) == FIELD_W * FIELD_H * 3:
-                try:
-                    surf = pygame.image.frombuffer(frame, (FIELD_W, FIELD_H), 'RGB')
-                    s.blit(surf, (0, 0))
-                except Exception:
-                    # fallback to LUT path
-                    rgb = apply_lut(np.frombuffer(frame, dtype=np.uint8).reshape(FIELD_H, FIELD_W))
-                    surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-                    s.blit(surf, (0, 0))
-            else:
-                rgb  = apply_lut(frame)
-                surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-                surf.set_alpha(210)
-                s.blit(surf, (0, 0))
+            rgb  = apply_lut(frame)
+            surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+            surf.set_alpha(210)
+            s.blit(surf, (0, 0))
 
-        # Grid overlay
-        s.blit(self._field_grid, (0, 0))
-
-        # Source dots
         for i, a in enumerate(self.antennas):
             ix, iy = int(a.x), int(a.y)
-            col = self._source_colour(i)
-            label = self._source_label(i)
             if i == self.sel:
                 pygame.draw.circle(s, C_WHITE, (ix, iy), 14, 2)
-            pygame.draw.circle(s, col, (ix, iy), 10)
-            lbl = self.font_sm.render(label, True, C_WHITE)
+            pygame.draw.circle(s, a.colour, (ix, iy), 10)
+
+            # Direction arrow (when dir_strength > 0.05)
+            if a.dir_strength > 0.05:
+                rad = math.radians(a.direction)
+                ex  = ix + int(16 * math.cos(rad))
+                ey  = iy + int(16 * math.sin(rad))
+                pygame.draw.line(s, C_WHITE, (ix, iy), (ex, ey), 2)
+
+            lbl = self.font_sm.render(a.label, True, C_WHITE)
             s.blit(lbl, (ix - lbl.get_width() // 2, iy - lbl.get_height() // 2))
 
         # HUD
@@ -667,6 +598,7 @@ class WaveFormApp:
             f"N={len(self.antennas)}",
             f"recv {_recv_fps:5.1f} fps",
             f"disp {self._disp_fps:5.1f} fps",
+            f"t={self._global_time:>4d}",
         ]
         lh  = 15
         hw  = 116
@@ -678,145 +610,133 @@ class WaveFormApp:
             t = self.font_sm.render(ln, True, C_CYAN)
             s.blit(t, (10, 9 + i * lh))
 
-    # ── Panel ──────────────────────────────────────────────────────────────────
-    def _draw_panel(self, s):
+    def _draw_panel(self):
+        s  = self.screen
         px = PANEL_X
         pw = PANEL_W
-        pw = PANEL_W
 
-        # Background
         pygame.draw.rect(s, C_PANEL, (px, 0, pw, WINDOW_H))
-
-        # Ripple decoration (corner motif)
         draw_ripple(s, px + 2, 2, n=5, max_r=50)
 
-        # ── Header ────────────────────────────────────────────────────────────
+        # Header
         draw_grad_text(s, "WaveForm", self.font_title, px + 14, 7, C_MINT, C_LAVENDER)
         sub = self.font_sm.render("EM SOURCE CONTROL", True, C_SEC)
         s.blit(sub, (px + 14, 31))
         pygame.draw.line(s, C_BORDER, (px, 50), (px + pw, 50), 1)
 
-        # ── Source list ────────────────────────────────────────────────────────
-        row_h   = 22
-        list_y  = 56
-        n_vis   = min(len(self.antennas), MAX_VIS)
-        card_h  = max(n_vis, 1) * row_h + 8
-        card_r  = pygame.Rect(px + 8, list_y, pw - 16, card_h)
+        # Source list
+        row_h  = 20
+        list_y = 56
+        n_vis  = min(len(self.antennas), MAX_VIS)
+        card_h = max(n_vis, 1) * row_h + 6
+        card_r = pygame.Rect(px + 8, list_y, pw - 16, card_h)
 
         draw_fill  (s, card_r, 6, C_SELROW, alpha=255)
         draw_border(s, card_r, 6, C_MINT,   alpha=76)
 
         if not self.antennas:
             empty_t = self.font_sm.render("(no sources)", True, C_SEC)
-            s.blit(empty_t, (card_r.centerx - empty_t.get_width() // 2,
-                             list_y + 9))
+            s.blit(empty_t, (card_r.centerx - empty_t.get_width() // 2, list_y + 8))
 
         self._clamp_scroll()
         self._row_rects = []
         for vis_i in range(n_vis):
-            ant_i    = self._list_off + vis_i
-            a        = self.antennas[ant_i]
-            ry       = list_y + 4 + vis_i * row_h
-            row_r    = pygame.Rect(px + 8, ry, pw - 16, row_h)
+            ant_i = self._list_off + vis_i
+            a     = self.antennas[ant_i]
+            ry    = list_y + 3 + vis_i * row_h
+            row_r = pygame.Rect(px + 8, ry, pw - 16, row_h)
             self._row_rects.append(row_r)
             if ant_i == self.sel:
                 draw_fill  (s, row_r, 4, C_SELROW, alpha=255)
                 draw_border(s, row_r, 4, C_CYAN,   alpha=255, w=1)
-            col = self._source_colour(ant_i)
-            label = self._source_label(ant_i)
-            pygame.draw.circle(s, col, (px + 20, ry + row_h // 2), 5)
-            lbl  = self.font_sm.render(label, True, C_WHITE)
-            s.blit(lbl,  (px + 30,  ry + 5))
-            amp  = self.font_sm.render(f"{a.amplitude:.2f}", True, C_SEC)
-            s.blit(amp,  (px + 58,  ry + 5))
-            freq = self.font_sm.render(f"×{a.frequency:.2f}", True, C_SEC)
-            s.blit(freq, (px + 102, ry + 5))
-            pos  = self.font_sm.render(f"({int(a.x)},{int(a.y)})", True, C_SEC)
-            s.blit(pos,  (px + 155, ry + 5))
+            pygame.draw.circle(s, a.colour, (px + 20, ry + row_h // 2), 5)
+            s.blit(self.font_sm.render(a.label,               True, C_WHITE),
+                   (px + 30,  ry + 4))
+            s.blit(self.font_sm.render(f"{a.amplitude:.2f}",  True, C_SEC),
+                   (px + 58,  ry + 4))
+            s.blit(self.font_sm.render(f"×{a.frequency:.1f}", True, C_SEC),
+                   (px + 100, ry + 4))
+            s.blit(self.font_sm.render(f"d{q_direction(a.direction)*5}°", True, C_SEC),
+                   (px + 148, ry + 4))
+            s.blit(self.font_sm.render(f"({int(a.x)},{int(a.y)})", True, C_SEC),
+                   (px + 195, ry + 4))
 
-        # Scroll indicator dots if list is clipped
-        if len(self.antennas) > MAX_VIS:
-            total  = len(self.antennas)
-            dot_x0 = card_r.right - 10
-            for i in range(total):
-                col = C_CYAN if i == self.sel else C_BORDER
-                pygame.draw.circle(s, col,
-                                   (dot_x0 - (total - 1 - i) * 6,
-                                    list_y + card_h + 4), 2)
-
-        # ── Add / Del buttons ──────────────────────────────────────────────────
-        btn_y = list_y + card_h + 8 + (6 if len(self.antennas) > MAX_VIS else 0)
-        self._add_rect = pygame.Rect(px + 10, btn_y, 92, 20)
-        self._del_rect = pygame.Rect(px + 110, btn_y, 92, 20)
+        # Add / Del buttons
+        btn_y = list_y + card_h + 6
+        self._add_rect = pygame.Rect(px + 10, btn_y, 88, 18)
+        self._del_rect = pygame.Rect(px + 106, btn_y, 88, 18)
 
         pygame.draw.rect(s, C_PANEL,  self._add_rect, border_radius=4)
         pygame.draw.rect(s, C_CYAN,   self._add_rect, 1, border_radius=4)
         pygame.draw.rect(s, C_PANEL,  self._del_rect, border_radius=4)
         pygame.draw.rect(s, C_DANGER, self._del_rect, 1, border_radius=4)
-        add_t = self.font_sm.render("+ Add", True, C_CYAN)
-        del_t = self.font_sm.render("× Del", True, C_DANGER)
-        s.blit(add_t, (self._add_rect.centerx - add_t.get_width() // 2, btn_y + 4))
-        s.blit(del_t, (self._del_rect.centerx - del_t.get_width() // 2, btn_y + 4))
+        s.blit(self.font_sm.render("+ Add", True, C_CYAN),
+               (self._add_rect.centerx - 18, btn_y + 3))
+        s.blit(self.font_sm.render("× Del", True, C_DANGER),
+               (self._del_rect.centerx - 18, btn_y + 3))
 
-        # ── Divider ────────────────────────────────────────────────────────────
-        div_y = btn_y + 26
+        # Divider
+        div_y = btn_y + 24
         pygame.draw.line(s, C_BORDER, (px + 8, div_y), (px + pw - 8, div_y), 1)
 
-        # ── Selected source controls ───────────────────────────────────────────
-        ctrl_y  = div_y + 6
-        ctrl_h  = WINDOW_H - ctrl_y - 22
-        ctrl_r  = pygame.Rect(px + 8, ctrl_y, pw - 16, ctrl_h)
+        # Selected source controls
+        ctrl_y = div_y + 6
+        ctrl_h = WINDOW_H - ctrl_y - 20
+        ctrl_r = pygame.Rect(px + 8, ctrl_y, pw - 16, ctrl_h)
         draw_border(s, ctrl_r, 6, C_MINT, alpha=76)
 
         if not self.antennas:
-            none_t = self.font_sm.render("(no source selected)", True, C_SEC)
-            s.blit(none_t, (ctrl_r.centerx - none_t.get_width() // 2,
-                            ctrl_y + 14))
+            t = self.font_sm.render("(no source selected)", True, C_SEC)
+            s.blit(t, (ctrl_r.centerx - t.get_width() // 2, ctrl_y + 12))
         else:
-            ant = self.antennas[self.sel]
+            ant   = self.antennas[self.sel]
+            sl_x  = px + 16
+            sl_w  = pw - 32
 
-            # Sub-header (dot + label)
-            col = self._source_colour(self.sel)
-            label = self._source_label(self.sel)
-            pygame.draw.circle(s, col, (px + 20, ctrl_y + 13), 6)
-            hdr = self.font_md.render(label, True, C_WHITE)
-            s.blit(hdr, (px + 32, ctrl_y + 5))
+            # Sub-header
+            pygame.draw.circle(s, ant.colour, (px + 20, ctrl_y + 12), 6)
+            s.blit(self.font_md.render(ant.label, True, C_WHITE),
+                   (px + 32, ctrl_y + 4))
 
-            # Update slider rects (preserves dragging state)
-            sl_x = px + 16
-            sl_w = pw - 32
-            self._amp_sl.fill_col = col
-            self._amp_sl.set_rect (sl_x, ctrl_y + 40, sl_w)
-            self._freq_sl.set_rect(sl_x, ctrl_y + 86, sl_w)
-
-            if not self._amp_sl.dragging:
-                self._amp_sl.value = ant.amplitude
-            if not self._freq_sl.dragging:
-                self._freq_sl.value = ant.frequency
-
-            self._amp_sl.draw (s, self.font_sm)
-            self._freq_sl.draw(s, self.font_sm)
+            # ── Four sliders ─────────────────────────────────────────────────
+            self._amp_sl.fill_col = ant.colour
+            offsets = [28, 62, 96, 130]   # track y offsets from ctrl_y
+            for sl, off, ant_val in [
+                (self._amp_sl,  offsets[0], ant.amplitude),
+                (self._freq_sl, offsets[1], ant.frequency),
+                (self._dstr_sl, offsets[2], ant.dir_strength),
+                (self._dir_sl,  offsets[3], ant.direction),
+            ]:
+                sl.set_rect(sl_x, ctrl_y + off, sl_w)
+                if not sl.dragging:
+                    sl.value = ant_val
+                sl.draw(s, self.font_sm)
 
             # Position readout
-            pos_y = ctrl_y + 112
-            pos_t = self.font_sm.render(
-                f"x {int(ant.x):>3d}  y {int(ant.y):>3d}", True, C_WHITE)
-            s.blit(pos_t, (px + 16, pos_y))
+            pos_y = ctrl_y + 158
+            s.blit(self.font_sm.render(
+                f"x {int(ant.x):>3d}  y {int(ant.y):>3d}", True, C_WHITE),
+                (px + 16, pos_y))
 
-            # Minimap (56×56)
+            # Minimap
             mm_x, mm_y, mm_w, mm_h = px + 16, pos_y + 16, 56, 56
             mm_r = pygame.Rect(mm_x, mm_y, mm_w, mm_h)
             pygame.draw.rect(s, C_BG, mm_r)
             draw_border(s, mm_r, 4, C_MINT, alpha=76)
-            dot_x = mm_x + int(ant.x / FIELD_W * mm_w)
-            dot_y = mm_y + int(ant.y / FIELD_H * mm_h)
-            pygame.draw.circle(s, col, (dot_x, dot_y), 3)
-            drag_t = self.font_sm.render("drag on field", True, C_SEC)
-            s.blit(drag_t, (mm_x + mm_w + 6, mm_y + 20))
+            pygame.draw.circle(s, ant.colour,
+                                (mm_x + int(ant.x / FIELD_W * mm_w),
+                                 mm_y + int(ant.y / FIELD_H * mm_h)), 3)
+            s.blit(self.font_sm.render("drag on field", True, C_SEC),
+                   (mm_x + mm_w + 4, mm_y + 18))
 
-        # ── Footer ─────────────────────────────────────────────────────────────
+            # Protocol info line
+            pkt_t = self.font_sm.render(
+                f"pkt {PACKET_BYTES}B  seq {self._send_seq:05d}", True, C_BORDER)
+            s.blit(pkt_t, (px + 16, ctrl_y + ctrl_h - 14))
+
+        # Footer
         foot = self.font_sm.render(
-            "Tab: cycle   Del: remove", True, C_SEC)
+            "Tab: cycle   Del: remove   F11: fullscreen", True, C_SEC)
         s.blit(foot, (px + 8, WINDOW_H - 16))
 
 
