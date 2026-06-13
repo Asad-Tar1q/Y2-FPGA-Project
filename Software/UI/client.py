@@ -24,6 +24,12 @@ import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib
 
+from waveform_protocol import (
+    pack_packet, PACKET_BYTES,
+    q_amplitude, dq_amplitude, q_frequency, dq_frequency,
+    q_directivity, dq_directivity, q_direction, dq_direction,
+)
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 WINDOW_W    = 920       # initial window width
 WINDOW_H    = 480       # initial window height
@@ -38,9 +44,6 @@ MIN_SEP     = 26
 HOST       = "127.0.0.1"
 FRAME_PORT = 5000
 CTRL_PORT  = 5001
-CTRL_FMT   = ">BBHHffff"
-CTRL_SIZE  = struct.calcsize(CTRL_FMT)   # 20 bytes
-SEND_HZ    = 30
 
 SOURCE_COLS_F = [
     (0.000, 0.784, 0.863),
@@ -83,8 +86,21 @@ _latest_frame = None
 _recv_fps     = 0.0
 _ctrl_sock    = None
 _ctrl_lock    = threading.Lock()
-_last_send_t  = 0.0
 _paused       = False
+
+GLOBAL_TICK_HZ = 60                  # PS time-counter rate; 16-bit wraps ~every 18 min
+_clock_accum   = 0.0                 # accumulated running seconds (frozen while paused)
+_clock_last    = time.monotonic()
+
+
+def global_time():
+    """16-bit PS time counter; advances with real time but freezes while paused."""
+    global _clock_accum, _clock_last
+    now = time.monotonic()
+    if not _paused:
+        _clock_accum += now - _clock_last
+    _clock_last = now
+    return int(_clock_accum * GLOBAL_TICK_HZ) & 0xFFFF
 
 
 def _recv_loop():
@@ -142,53 +158,20 @@ def _connect_ctrl():
         return False
 
 
-def _raw_send(ant):
-    msg = struct.pack(CTRL_FMT,
-                      ant.id & 0xFF, 0,
-                      int(ant.x) & 0xFFFF, int(ant.y) & 0xFFFF,
-                      max(0.0, min(1.0, ant.amplitude)),
-                      ant.frequency,
-                      ant.theta_0,
-                      max(0.0, min(1.0, ant.a)))
+def _sources_from_antennas(antennas):
+    return [{"amplitude": a.amplitude, "frequency": a.frequency,
+             "a": a.a, "theta_0": a.theta_0,
+             "x": int(a.x), "y": int(a.y)}
+            for a in antennas]
+
+
+def send_snapshot(antennas, paused=False):
+    pkt = pack_packet(global_time(), paused, _sources_from_antennas(antennas))
     with _ctrl_lock:
         if _ctrl_sock:
             try:
-                _ctrl_sock.sendall(msg)
-            except Exception:
-                pass
-
-
-def send_antenna(ant, force=False):
-    global _last_send_t
-    now = time.monotonic()
-    if not force and now - _last_send_t < 1.0 / SEND_HZ:
-        return
-    _last_send_t = now
-    _raw_send(ant)
-
-
-def send_all(antennas):
-    for a in antennas:
-        _raw_send(a)
-
-
-def send_delete(ant_id):
-    msg = struct.pack(CTRL_FMT, ant_id & 0xFF, 1, 0, 0, 0.0, 0.0, 0.0, 0.0)
-    with _ctrl_lock:
-        if _ctrl_sock:
-            try:
-                _ctrl_sock.sendall(msg)
-            except Exception:
-                pass
-
-
-def send_pause_toggle():
-    msg = struct.pack(CTRL_FMT, 0, 2, 0, 0, 0.0, 0.0, 0.0, 0.0)
-    with _ctrl_lock:
-        if _ctrl_sock:
-            try:
-                _ctrl_sock.sendall(msg)
-            except Exception:
+                _ctrl_sock.sendall(pkt)
+            except OSError:
                 pass
 
 
@@ -294,7 +277,6 @@ class WaveFormApp:
         self.antennas     = [Antenna()]
         self.sel          = 0
         self._drag_ant    = None
-        self._last_drag_t = 0.0
         self._disp_fps    = 0.0
         self._disp_n      = 0
         self._disp_t      = time.monotonic()
@@ -424,10 +406,10 @@ class WaveFormApp:
                     ny = float(max(0, min(FIELD_H - 1, fy)))
                     if not self._overlaps_any(nx, ny, self.sel):
                         ant.x, ant.y = nx, ny
-                        send_antenna(ant, force=True)
+                        send_snapshot(self.antennas, _paused)
             elif action == glfw.RELEASE:
                 if self._drag_ant is not None:
-                    send_antenna(self.antennas[self._drag_ant], force=True)
+                    send_snapshot(self.antennas, _paused)
                 self._drag_ant = None
 
     def _cursor_pos_cb(self, win, sx, sy):
@@ -438,10 +420,7 @@ class WaveFormApp:
             ny = float(max(0, min(FIELD_H - 1, fy)))
             if not self._overlaps_any(nx, ny, self._drag_ant):
                 a.x, a.y = nx, ny
-            now = time.monotonic()
-            if now - self._last_drag_t >= 1.0 / SEND_HZ:
-                send_antenna(a)
-                self._last_drag_t = now
+            # No send while dragging — the snapshot goes out on mouse release.
 
     def _key_cb(self, win, key, scancode, action, mods):
         global _paused
@@ -452,7 +431,7 @@ class WaveFormApp:
                 self._toggle_fullscreen()
             elif key == glfw.KEY_SPACE:
                 _paused = not _paused
-                send_pause_toggle()
+                send_snapshot(self.antennas, _paused)
             elif key == glfw.KEY_TAB and self.antennas:
                 self.sel = (self.sel + 1) % len(self.antennas)
             elif key == glfw.KEY_DELETE:
@@ -506,18 +485,17 @@ class WaveFormApp:
         a = Antenna(x, y)
         self.antennas.append(a)
         self.sel = len(self.antennas) - 1
-        send_antenna(a, force=True)
+        send_snapshot(self.antennas, _paused)
 
     def _del_ant(self):
         if not self.antennas:
             return
-        ant = self.antennas[self.sel]
-        send_delete(ant.id)
         del self.antennas[self.sel]
         if self.antennas:
             self.sel = min(self.sel, len(self.antennas) - 1)
         else:
             self.sel = 0
+        send_snapshot(self.antennas, _paused)
 
     # ── GL rendering ──────────────────────────────────────────────────────────
     def _draw_field(self, frame):
@@ -602,6 +580,11 @@ class WaveFormApp:
 
         imgui.separator()
 
+        # Global time counter (PS clock — placeholder readout for now)
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.302, 0.502, 0.702, 1.0)
+        imgui.text(f"t {global_time():5d}")
+        imgui.pop_style_color()
+
         # Pause / Resume
         p_col = (0.863, 0.275, 0.275, 1.0) if not _paused else (0.275, 0.784, 0.275, 1.0)
         imgui.push_style_color(imgui.COLOR_TEXT,           *p_col)
@@ -610,7 +593,7 @@ class WaveFormApp:
         pause_label = "|| Pause" if not _paused else ">  Resume"
         if imgui.button(pause_label, width=PANEL_W - 16):
             _paused = not _paused
-            send_pause_toggle()
+            send_snapshot(self.antennas, _paused)
         imgui.pop_style_color(3)
 
         imgui.separator()
@@ -623,8 +606,8 @@ class WaveFormApp:
             dl.add_circle_filled(cx + 6, cy + 8, 5,
                                  imgui.get_color_u32_rgba(col[0], col[1], col[2], 1.0))
             imgui.set_cursor_pos_x(imgui.get_cursor_pos()[0] + 16)
-            label = (f"A{i+1}  A={ant.amplitude:.2f}  a={ant.a:.2f}"
-                     f"  th={ant.theta_0:.2f}##row{i}")
+            label = (f"A{i+1}  A={ant.amplitude:.2f}  f={ant.frequency:.1f}"
+                     f"  a={ant.a:.2f}  th={math.degrees(ant.theta_0):.0f}°##row{i}")
             clicked, _ = imgui.selectable(label, i == self.sel, width=PANEL_W - 28)
             if clicked:
                 self.sel = i
@@ -664,8 +647,9 @@ class WaveFormApp:
             imgui.pop_style_color()
             changed, v = imgui.slider_float("##amp", ant.amplitude, 0.0, 1.0)
             if changed:
-                ant.amplitude = v
-                send_antenna(ant)
+                ant.amplitude = dq_amplitude(q_amplitude(v))   # snap to 8-bit grid
+            if imgui.is_item_deactivated_after_edit():
+                send_snapshot(self.antennas, _paused)
 
             imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
             imgui.text("Frequency")
@@ -673,25 +657,30 @@ class WaveFormApp:
             changed, v = imgui.slider_float("##freq", ant.frequency, 0.1, 10.0,
                                             format="x%.2f")
             if changed:
-                ant.frequency = v
-                send_antenna(ant)
+                ant.frequency = dq_frequency(q_frequency(v))   # snap to 8-bit grid
+            if imgui.is_item_deactivated_after_edit():
+                send_snapshot(self.antennas, _paused)
 
             imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
             imgui.text("Direction")
             imgui.pop_style_color()
-            changed, v = imgui.slider_float("##theta", ant.theta_0,
-                                            0.0, 6.2832, format="%.2f rad")
+            deg = math.degrees(ant.theta_0)
+            changed, v = imgui.slider_float("##theta", deg, 0.0, 360.0,
+                                            format="%.0f deg")
             if changed:
-                ant.theta_0 = v
-                send_antenna(ant)
+                # snap to the 7-bit, 5-degree grid
+                ant.theta_0 = dq_direction(q_direction(math.radians(v)))
+            if imgui.is_item_deactivated_after_edit():
+                send_snapshot(self.antennas, _paused)
 
             imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
             imgui.text("Directivity")
             imgui.pop_style_color()
             changed, v = imgui.slider_float("##a", ant.a, 0.0, 1.0)
             if changed:
-                ant.a = v
-                send_antenna(ant)
+                ant.a = dq_directivity(q_directivity(v))   # snap to 8-bit grid
+            if imgui.is_item_deactivated_after_edit():
+                send_snapshot(self.antennas, _paused)
 
             imgui.pop_item_width()
 
@@ -764,7 +753,7 @@ class WaveFormApp:
     def run(self):
         threading.Thread(target=_recv_loop, daemon=True).start()
         _connect_ctrl()
-        send_all(self.antennas)
+        send_snapshot(self.antennas, _paused)
 
         while not glfw.window_should_close(self.window):
             glfw.poll_events()

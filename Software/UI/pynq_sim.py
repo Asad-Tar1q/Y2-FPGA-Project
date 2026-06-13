@@ -1,7 +1,7 @@
 """
 WaveForm — Simulated PYNQ-Z1 FPGA backend.
 Run:  python pynq_sim.py
-Port 5001 — receives 20-byte antenna control structs from client.
+Port 5001 — receives 37-byte bit-packed control packets from client.
 Port 5000 — streams uint8 frames (4-byte big-endian length header) to client.
 """
 
@@ -12,14 +12,14 @@ import time
 
 import numpy as np
 
+from waveform_protocol import PACKET_BYTES, unpack_packet
+
 HOST        = "0.0.0.0"
 FRAME_PORT  = 5000
 CTRL_PORT   = 5001
 FIELD_W     = 640
 FIELD_H     = 480
 FRAME_BYTES = FIELD_W * FIELD_H
-CTRL_FMT    = ">BBHHffff"
-CTRL_SIZE   = struct.calcsize(CTRL_FMT)   # 20 bytes
 
 TARGET_FPS  = 30.0
 
@@ -42,49 +42,52 @@ _XX, _YY = np.meshgrid(_xs, _ys)
 # ── Control server — port 5001 ─────────────────────────────────────────────────
 def _handle_ctrl(conn, addr):
     global _paused
-    print(f"[ctrl] connected {addr}")
+    print(f"[ctrl] {addr} connected — {PACKET_BYTES}-byte packets")
     buf = b""
     try:
         while True:
-            chunk = conn.recv(256)
+            chunk = conn.recv(512)
             if not chunk:
                 break
             buf += chunk
-            while len(buf) >= CTRL_SIZE:
-                raw = buf[:CTRL_SIZE]
-                buf = buf[CTRL_SIZE:]
-                ant_id, cmd, x, y, amplitude, frequency, theta_0, a = \
-                    struct.unpack(CTRL_FMT, raw)
-                if cmd == 1:
-                    with _ant_lock:
-                        _antennas.pop(ant_id, None)
-                    print(f"  [PL] delete antenna {ant_id}")
-                elif cmd == 2:
-                    with _ant_lock:
-                        _paused = not _paused
-                    print(f"  [PL] simulation {'paused' if _paused else 'resumed'}")
-                else:
-                    amplitude = max(0.0, min(1.0, float(amplitude)))
-                    a         = max(0.0, min(1.0, float(a)))
-                    with _ant_lock:
-                        _antennas[ant_id] = {
-                            "id":        ant_id,
-                            "x":         int(x),
-                            "y":         int(y),
-                            "amplitude": amplitude,
-                            "frequency": float(frequency),
-                            "theta_0":   float(theta_0),
-                            "a":         a,
+            while len(buf) >= PACKET_BYTES:
+                raw, buf = buf[:PACKET_BYTES], buf[PACKET_BYTES:]
+                try:
+                    data = unpack_packet(raw)
+                except ValueError as e:
+                    print(f"[ctrl] bad packet: {e}")
+                    continue
+
+                with _ant_lock:
+                    _paused    = data["paused"]
+                    new_ants   = {}
+                    for i, s in enumerate(data["sources"]):
+                        new_ants[i] = {
+                            "id":        i,
+                            "x":         s["x"],
+                            "y":         s["y"],
+                            "amplitude": s["amplitude"],
+                            "frequency": s["frequency"],
+                            "theta_0":   s["theta_0"],   # radians, ready for frame gen
+                            "a":         s["a"],
                         }
-                    print(f"  [PL] antenna {ant_id}: "
-                          f"amp={amplitude:.3f}  freq=×{frequency:.3f}  "
-                          f"θ={theta_0:.3f}  a={a:.3f}  "
-                          f"pos=({int(x)},{int(y)})")
+                    _antennas.clear()
+                    _antennas.update(new_ants)
+
+                print(f"[PL] t={data['global_time']} "
+                      f"n={data['n_active']} paused={data['paused']}")
+                for i, s in enumerate(data["sources"]):
+                    raw_s = s["_raw"]
+                    print(f"     src{i}: amp={raw_s['amplitude']:>3} "
+                          f"freq={raw_s['frequency']:>3} "
+                          f"dir={raw_s['directivity']:>3} "
+                          f"th={raw_s['direction']:>2} "
+                          f"x={raw_s['x']:>3} y={raw_s['y']:>3}")
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
         conn.close()
-        print(f"[ctrl] disconnected {addr}")
+        print(f"[ctrl] {addr} disconnected")
 
 
 def _ctrl_server():
