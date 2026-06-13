@@ -15,6 +15,7 @@ import struct
 import math
 
 import pygame
+import pygame.freetype
 import numpy as np
 
 from waveform_protocol import (
@@ -59,6 +60,22 @@ SOURCE_COLS = [
     (220, 220, 100),
 ]
 
+class RenderFont:
+    def __init__(self, font):
+        self._font = font
+
+    def render(self, text, antialias, color):
+        surf, _ = self._font.render(text, fgcolor=color)
+        return surf
+
+    def size(self, text):
+        rect = self._font.get_rect(text)
+        return rect.width, rect.height
+
+    def render_to(self, surf, pos, text, color):
+        self._font.render_to(surf, pos, text, fgcolor=color)
+
+
 # ── CUDA / NumPy LUT ──────────────────────────────────────────────────────────
 _lut: np.ndarray | None = None
 _cuda_ready = False
@@ -68,11 +85,21 @@ _gpu_render = None
 
 
 def _build_viridis() -> np.ndarray:
-    t = np.linspace(0.0, 1.0, 256)
-    r = np.clip(0.267 + 0.004*t + 2.334*t**2 - 3.567*t**3 + 1.765*t**4, 0, 1)
-    g = np.clip(0.005 + 1.466*t - 0.720*t**2 + 0.222*t**3 - 0.028*t**4, 0, 1)
-    b = np.clip(0.329 + 1.498*t - 4.773*t**2 + 5.282*t**3 - 2.143*t**4, 0, 1)
-    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
+    """RdBu diverging map: negative → blue, zero → white, positive → red."""
+    neg  = np.array([33,  102, 172], dtype=np.float32)   # #2166AC
+    zero = np.array([247, 247, 247], dtype=np.float32)   # #F7F7F7
+    pos  = np.array([178, 24,  43],  dtype=np.float32)   # #B2182B
+    lut  = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        t = i / 255.0
+        if t <= 0.5:
+            u = t / 0.5
+            col = (1 - u) * neg + u * zero
+        else:
+            u = (t - 0.5) / 0.5
+            col = (1 - u) * zero + u * pos
+        lut[i] = np.clip(col + 0.5, 0, 255).astype(np.uint8)
+    return lut
 
 
 def _init_lut():
@@ -334,9 +361,24 @@ class WaveFormApp:
         pygame.display.set_caption("WaveForm — EM Field Renderer")
         self.clock = pygame.time.Clock()
 
-        self.font_title = pygame.font.SysFont("Courier New", 20, bold=True)
-        self.font_md    = pygame.font.SysFont("Courier New", 14, bold=True)
-        self.font_sm    = pygame.font.SysFont("Courier New", 11)
+        self.font_title = RenderFont(pygame.freetype.SysFont("Courier New", 20, bold=True))
+        self.font_md    = RenderFont(pygame.freetype.SysFont("Courier New", 14, bold=True))
+        self.font_sm    = RenderFont(pygame.freetype.SysFont("Courier New", 11))
+
+        # Pre-render static surfaces so the main loop doesn't rebuild them every frame
+        self._field_bg = pygame.Surface((FIELD_W, FIELD_H))
+        self._field_bg.fill(C_BG)
+        self._field_grid = pygame.Surface((FIELD_W, FIELD_H), pygame.SRCALPHA)
+        grid_col = (255, 255, 255, 120)
+        for _x in range(0, FIELD_W + 1, GRID_STEP):
+            pygame.draw.line(self._field_grid, grid_col, (_x, 0), (_x, FIELD_H))
+        for _y in range(0, FIELD_H + 1, GRID_STEP):
+            pygame.draw.line(self._field_grid, grid_col, (0, _y), (FIELD_W, _y))
+        try:
+            self._field_bg   = self._field_bg.convert()
+            self._field_grid = self._field_grid.convert_alpha()
+        except Exception:
+            pass
 
         self.antennas: list[Antenna] = [Antenna()]
         self.sel       = 0
@@ -564,10 +606,7 @@ class WaveFormApp:
 
     def _draw_field(self):
         s = self.screen
-        for x in range(0, FIELD_W + 1, GRID_STEP):
-            pygame.draw.line(s, C_BORDER, (x, 0), (x, FIELD_H))
-        for y in range(0, FIELD_H + 1, GRID_STEP):
-            pygame.draw.line(s, C_BORDER, (0, y), (FIELD_W, y))
+        s.blit(self._field_bg, (0, 0))
 
         with _frame_lock:
             frame = _latest_frame
@@ -576,6 +615,8 @@ class WaveFormApp:
             surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
             surf.set_alpha(210)
             s.blit(surf, (0, 0))
+
+        s.blit(self._field_grid, (0, 0))
 
         for i, a in enumerate(self.antennas):
             ix, iy = int(a.x), int(a.y)
