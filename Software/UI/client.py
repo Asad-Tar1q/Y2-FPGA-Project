@@ -31,7 +31,7 @@ FIELD_W     = 640       # texture / simulation resolution
 FIELD_H     = 480
 PANEL_W     = 280       # sidebar always this wide
 GRID_STEP   = 40
-MAX_SOURCES = 8
+MAX_SOURCES = 5
 MIN_SEP     = 26
 
 # ── Network ────────────────────────────────────────────────────────────────────
@@ -233,6 +233,30 @@ void main() {
 }
 """
 
+_CIRCLE_VERT = """
+#version 330 core
+in vec2 in_vert;
+in vec2 in_uv;
+out vec2 frag_uv;
+void main() {
+    frag_uv = in_uv;
+    gl_Position = vec4(in_vert, 0.0, 1.0);
+}
+"""
+
+_CIRCLE_FRAG = """
+#version 330 core
+uniform vec4  u_colour;
+uniform float u_inner;
+in vec2 frag_uv;
+out vec4 fragColour;
+void main() {
+    float d = length(frag_uv);
+    if (d > 1.0 || d < u_inner) discard;
+    fragColour = u_colour;
+}
+"""
+
 
 # ── Application ────────────────────────────────────────────────────────────────
 class WaveFormApp:
@@ -252,6 +276,8 @@ class WaveFormApp:
             raise RuntimeError("GLFW window creation failed")
 
         glfw.make_context_current(self.window)
+        glfw.set_window_size_limits(self.window, WINDOW_W, 520,
+                                    glfw.DONT_CARE, glfw.DONT_CARE)
         glfw.swap_interval(1)
 
         self.ctx = moderngl.create_context()
@@ -326,9 +352,13 @@ class WaveFormApp:
         self.grid_vao = ctx.vertex_array(
             self.col_prog, [(self.grid_vbo, '2f', 'in_vert')])
 
-        self.dot_vbo = ctx.buffer(reserve=48)
+        self.circle_prog = ctx.program(
+            vertex_shader=_CIRCLE_VERT, fragment_shader=_CIRCLE_FRAG)
+
+        # 6 verts × (pos xy + uv xy) × 4 bytes
+        self.dot_vbo = ctx.buffer(reserve=6 * 4 * 4)
         self.dot_vao = ctx.vertex_array(
-            self.col_prog, [(self.dot_vbo, '2f', 'in_vert')])
+            self.circle_prog, [(self.dot_vbo, '2f 2f', 'in_vert', 'in_uv')])
 
         # Write initial geometry
         self._rebuild_geometry()
@@ -507,7 +537,6 @@ class WaveFormApp:
     def _draw_dots(self):
         if not self.antennas:
             return
-        # Dot radii in NDC — scale with window so dots stay roughly same screen size
         r_px  = 10.0
         sr_px = 14.0
         r_nx  = r_px  / self.win_w * 2.0
@@ -521,12 +550,15 @@ class WaveFormApp:
         for i, ant in enumerate(self.antennas):
             cx, cy = self._field_to_ndc(ant.x, ant.y)
             if i == self.sel:
-                self.dot_vbo.write(_quad_verts(cx, cy, sr_nx, sr_ny))
-                self.col_prog['u_colour'].value = (1.0, 1.0, 1.0, 1.0)
+                # White ring: filled outer circle, hollow at 0.65 of radius
+                self.dot_vbo.write(_circle_verts(cx, cy, sr_nx, sr_ny))
+                self.circle_prog['u_colour'].value = (1.0, 1.0, 1.0, 1.0)
+                self.circle_prog['u_inner'].value  = 0.65
                 self.dot_vao.render(moderngl.TRIANGLES, vertices=6)
             col = ant.colour
-            self.dot_vbo.write(_quad_verts(cx, cy, r_nx, r_ny))
-            self.col_prog['u_colour'].value = (col[0], col[1], col[2], 1.0)
+            self.dot_vbo.write(_circle_verts(cx, cy, r_nx, r_ny))
+            self.circle_prog['u_colour'].value = (col[0], col[1], col[2], 1.0)
+            self.circle_prog['u_inner'].value  = 0.0
             self.dot_vao.render(moderngl.TRIANGLES, vertices=6)
 
         self.ctx.disable(moderngl.BLEND)
@@ -591,7 +623,7 @@ class WaveFormApp:
             dl.add_circle_filled(cx + 6, cy + 8, 5,
                                  imgui.get_color_u32_rgba(col[0], col[1], col[2], 1.0))
             imgui.set_cursor_pos_x(imgui.get_cursor_pos()[0] + 16)
-            label = (f"{ant.label}  A={ant.amplitude:.2f}  a={ant.a:.2f}"
+            label = (f"A{i+1}  A={ant.amplitude:.2f}  a={ant.a:.2f}"
                      f"  th={ant.theta_0:.2f}##row{i}")
             clicked, _ = imgui.selectable(label, i == self.sel, width=PANEL_W - 28)
             if clicked:
@@ -623,27 +655,40 @@ class WaveFormApp:
             dl.add_circle_filled(cx + 6, cy + 8, 6,
                                  imgui.get_color_u32_rgba(col[0], col[1], col[2], 1.0))
             imgui.set_cursor_pos_x(imgui.get_cursor_pos()[0] + 16)
-            imgui.text(ant.label)
+            imgui.text(f"A{self.sel + 1}")
 
             imgui.push_item_width(PANEL_W - 32)
 
-            changed, v = imgui.slider_float("Amplitude##amp", ant.amplitude, 0.0, 1.0)
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("Amplitude")
+            imgui.pop_style_color()
+            changed, v = imgui.slider_float("##amp", ant.amplitude, 0.0, 1.0)
             if changed:
                 ant.amplitude = v
                 send_antenna(ant)
 
-            changed, v = imgui.slider_float("Frequency##freq", ant.frequency, 0.1, 10.0)
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("Frequency")
+            imgui.pop_style_color()
+            changed, v = imgui.slider_float("##freq", ant.frequency, 0.1, 10.0,
+                                            format="x%.2f")
             if changed:
                 ant.frequency = v
                 send_antenna(ant)
 
-            changed, v = imgui.slider_float("Direction##theta", ant.theta_0,
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("Direction")
+            imgui.pop_style_color()
+            changed, v = imgui.slider_float("##theta", ant.theta_0,
                                             0.0, 6.2832, format="%.2f rad")
             if changed:
                 ant.theta_0 = v
                 send_antenna(ant)
 
-            changed, v = imgui.slider_float("Directivity##a", ant.a, 0.0, 1.0)
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("Directivity")
+            imgui.pop_style_color()
+            changed, v = imgui.slider_float("##a", ant.a, 0.0, 1.0)
             if changed:
                 ant.a = v
                 send_antenna(ant)
@@ -672,10 +717,43 @@ class WaveFormApp:
             imgui.text("drag on field")
             imgui.pop_style_color()
 
-        # Footer — pinned to bottom of panel
-        imgui.set_cursor_pos((imgui.get_cursor_pos()[0], self.win_h - 20))
+        # Footer — keybind hints + FPS, pinned to bottom
+        imgui.set_cursor_pos((8, self.win_h - 68))
+        imgui.push_style_color(imgui.COLOR_SEPARATOR, 0.102, 0.208, 0.314, 1.0)
+        imgui.separator()
+        imgui.pop_style_color()
+
+        imgui.set_cursor_pos((8, self.win_h - 54))
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.000, 0.784, 0.863, 1.0)
+        imgui.text("Space")
+        imgui.pop_style_color()
+        imgui.same_line(spacing=6)
         imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
-        imgui.text("Tab  Space  Del  F11")
+        imgui.text("pause / resume")
+        imgui.pop_style_color()
+
+        imgui.set_cursor_pos((8, self.win_h - 38))
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.000, 0.784, 0.863, 1.0)
+        imgui.text("Tab")
+        imgui.pop_style_color()
+        imgui.same_line(spacing=6)
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+        imgui.text("cycle")
+        imgui.pop_style_color()
+        imgui.same_line(spacing=14)
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.000, 0.784, 0.863, 1.0)
+        imgui.text("Del")
+        imgui.pop_style_color()
+        imgui.same_line(spacing=6)
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+        imgui.text("remove")
+        imgui.pop_style_color()
+
+        imgui.set_cursor_pos((8, self.win_h - 18))
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.302, 0.502, 0.702, 1.0)
+        imgui.text(f"disp {self._disp_fps:4.0f} fps")
+        imgui.same_line(spacing=10)
+        imgui.text(f"recv {_recv_fps:4.0f} fps")
         imgui.pop_style_color()
 
         imgui.end()
@@ -727,6 +805,20 @@ def _quad_verts(cx, cy, rx, ry):
     return np.array([
         l, b,  r, b,  l, t,
         r, b,  r, t,  l, t,
+    ], dtype='f4').tobytes()
+
+
+def _circle_verts(cx, cy, rx, ry):
+    """Quad with UV in [-1,1]×[-1,1]; fragment shader clips to unit circle."""
+    l, r = cx - rx, cx + rx
+    b, t = cy - ry, cy + ry
+    return np.array([
+        l, b, -1.0, -1.0,
+        r, b,  1.0, -1.0,
+        l, t, -1.0,  1.0,
+        r, b,  1.0, -1.0,
+        r, t,  1.0,  1.0,
+        l, t, -1.0,  1.0,
     ], dtype='f4').tobytes()
 
 
