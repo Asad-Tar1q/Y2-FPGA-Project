@@ -1,0 +1,33 @@
+regfile[0]  TIME
+
+regfile[1]  SRC1_POS       {Y[15:0], X[15:0]}
+regfile[2]  SRC2_POS       {Y[15:0], X[15:0]}
+
+regfile[3]  SRC1_CFG
+            bit 0      enable
+            bit 1      moving enable
+            bits 7:4   phase offset
+            bits 11:8  gain, 8 = normal strength
+
+regfile[4]  SRC2_CFG
+            same as SRC1_CFG
+
+regfile[5]  BLOCKER0_P0    {Y0[15:0], X0[15:0]}
+regfile[6]  BLOCKER0_P1    {Y1[15:0], X1[15:0]}
+regfile[7]  BLOCKER0_CFG   bit 0 = enable
+
+regfile[8]  BLOCKER1_P0
+regfile[9]  BLOCKER1_P1
+regfile[10] BLOCKER1_CFG   bit 0 = enable
+
+regfile[11] REFLECTOR0_P0  {Y0[15:0], X0[15:0]}
+regfile[12] REFLECTOR0_P1  {Y1[15:0], X1[15:0]}
+regfile[13] REFLECTOR0_CFG
+            bit 0      enable
+            bits 11:8  reflection gain, default 4 = half strength
+            bit 12     invert phase
+
+regfile[14] REFLECTOR1_P0
+regfile[15] REFLECTOR1_P1
+regfile[16] REFLECTOR1_CFG
+            same as REFLECTOR0_CFG
