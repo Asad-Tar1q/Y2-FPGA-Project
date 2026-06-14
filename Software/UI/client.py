@@ -497,6 +497,47 @@ class WaveFormApp:
             self.sel = 0
         send_snapshot(self.antennas, _paused)
 
+    def _apply_preset(self, name: str):
+        for ant in self.antennas:
+            send_delete(ant.id)
+        self.antennas.clear()
+
+        cx, cy = FIELD_W / 2.0, FIELD_H / 2.0
+        if name == "single":
+            defs = [
+                dict(x=cx, y=cy, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.0),
+            ]
+        elif name == "double":
+            defs = [
+                dict(x=cx - 100, y=cy, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.0),
+                dict(x=cx + 100, y=cy, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.0),
+            ]
+        elif name == "beamform":
+            # 4-element vertical array centred on FIELD_H/2, all beaming right (theta_0=0)
+            defs = [
+                dict(x=cx, y=cy - 90, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.85),
+                dict(x=cx, y=cy - 30, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.85),
+                dict(x=cx, y=cy + 30, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.85),
+                dict(x=cx, y=cy + 90, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.85),
+            ]
+        elif name == "interference":
+            # Two sources at different frequencies — beat / channel interference
+            defs = [
+                dict(x=cx - 80, y=cy, amplitude=0.75, frequency=1.0, theta_0=0.0, a=0.0),
+                dict(x=cx + 80, y=cy, amplitude=0.75, frequency=2.5, theta_0=0.0, a=0.0),
+            ]
+        else:
+            defs = []
+
+        for d in defs:
+            ant = Antenna(d['x'], d['y'], d['amplitude'], d['frequency'])
+            ant.theta_0 = d['theta_0']
+            ant.a = d['a']
+            self.antennas.append(ant)
+
+        self.sel = 0
+        send_all(self.antennas)
+
     # ── GL rendering ──────────────────────────────────────────────────────────
     def _draw_field(self, frame):
         if frame is not None:
@@ -594,6 +635,27 @@ class WaveFormApp:
         if imgui.button(pause_label, width=PANEL_W - 16):
             _paused = not _paused
             send_snapshot(self.antennas, _paused)
+        imgui.pop_style_color(3)
+
+        imgui.separator()
+
+        # Presets
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+        imgui.text("PRESETS")
+        imgui.pop_style_color()
+
+        imgui.push_style_color(imgui.COLOR_TEXT,           0.000, 0.784, 0.863, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON,         0.043, 0.098, 0.161, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.000, 0.784, 0.863, 0.2)
+        btn_w = PANEL_W - 16
+        if imgui.button("Single Shot##p", width=btn_w):
+            self._apply_preset("single")
+        if imgui.button("Double Shot##p", width=btn_w):
+            self._apply_preset("double")
+        if imgui.button("Beam Forming##p", width=btn_w):
+            self._apply_preset("beamform")
+        if imgui.button("Interference##p", width=btn_w):
+            self._apply_preset("interference")
         imgui.pop_style_color(3)
 
         imgui.separator()
