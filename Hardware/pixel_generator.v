@@ -9,6 +9,7 @@ output              out_stream_tlast,
 input               out_stream_tready,
 output              out_stream_tvalid,
 output [0:0]        out_stream_tuser, 
+
 input [AXI_LITE_ADDR_WIDTH-1:0]     s_axi_lite_araddr,
 output          s_axi_lite_arready,
 input           s_axi_lite_arvalid,
@@ -160,23 +161,131 @@ wire lasty = (y == Y_SIZE - 1);
 wire ready;
 
 always @(posedge out_stream_aclk) begin
-    if (periph_resetn) begin
-        if (ready & valid_int) begin
-            if (lastx) begin
-                x <= 9'd0;
-                if (lasty) y <= 9'd0;
-                else       y <= y + 9'd1;
-            end
-            else x <= x + 9'd1;
+    if (!periph_resetn) begin
+        for (i = 0; i < CORDIC_LATENCY; i = i+1) begin
+            x_dly[i]     <= 0;
+            y_dly[i]     <= 0;
+            first_dly[i] <= 0;
+            lastx_dly[i] <= 0;
+            lasty_dly[i] <= 0;
         end
-    end
-    else begin
-        x <= 0;
-        y <= 0;
+    end else if (pipeline_filled && ready) begin
+        for (i = 1; i < CORDIC_LATENCY; i = i+1) begin
+            x_dly[i]     <= x_dly[i-1];
+            y_dly[i]     <= y_dly[i-1];
+            first_dly[i] <= first_dly[i-1];
+            lastx_dly[i] <= lastx_dly[i-1];
+            lasty_dly[i] <= lasty_dly[i-1];
+        end
+        x_dly[0]     <= x;
+        y_dly[0]     <= y;
+        first_dly[0] <= first;
+        lastx_dly[0] <= lastx;
+        lasty_dly[0] <= lasty;
     end
 end
 
-wire valid_int = 1'b1;
+
+wire valid_int = pipeline_filled;
+
+localparam CORDIC_LATENCY = 20;   // adjust
+
+reg [$clog2(CORDIC_LATENCY+1)-1:0] pipeline_cnt;
+wire pipeline_filled = (pipeline_cnt == CORDIC_LATENCY);
+
+wire signed [15:0] cordic_dx1, cordic_dy1;
+wire signed [15:0] cordic_dx2, cordic_dy2;
+wire [15:0] cordic_magn1, cordic_magn2;
+wire [15:0] cordic_phase1, cordic_phase2;
+wire cordic_valid1, cordic_valid2;
+
+// CORDIC for source 1
+cordic_0 cordic1 (
+    .aclk(out_stream_aclk),
+    .aresetn(periph_resetn),
+    .s_axis_cartesian_tvalid(1'b1),
+    .s_axis_cartesian_tdata({cordic_dy1, cordic_dx1}), // {Y, X} in IP's expected order
+    .m_axis_dout_tvalid(cordic_valid1),
+    .m_axis_dout_tdata({cordic_phase1, cordic_magn1})  // {phase, magnitude}
+);
+
+// CORDIC for source 2
+cordic_0 cordic2 (
+    .aclk(out_stream_aclk),
+    .aresetn(periph_resetn),
+    .s_axis_cartesian_tvalid(1'b1),
+    .s_axis_cartesian_tdata({cordic_dy2, cordic_dx2}),
+    .m_axis_dout_tvalid(cordic_valid2),
+    .m_axis_dout_tdata({cordic_phase2, cordic_magn2})
+);
+
+// inputs to CORDICS
+wire [9:0] dx1_abs = (x > SRC1_X) ? (x - SRC1_X) : (SRC1_X - x);
+wire [8:0] dy1_abs = (y > SRC1_Y) ? (y - SRC1_Y) : (SRC1_Y - y);
+wire [9:0] dx2_abs = (x > SRC2_X) ? (x - SRC2_X) : (SRC2_X - x);
+wire [8:0] dy2_abs = (y > SRC2_Y) ? (y - SRC2_Y) : (SRC2_Y - y);
+
+assign cordic_dx1 = {6'd0, dx1_abs};  // extend to 16 bits
+assign cordic_dy1 = {7'd0, dy1_abs};
+assign cordic_dx2 = {6'd0, dx2_abs};
+assign cordic_dy2 = {7'd0, dy2_abs};
+
+// delay line
+reg [9:0]  x_dly [0:CORDIC_LATENCY-1];
+reg [8:0]  y_dly [0:CORDIC_LATENCY-1];
+reg        first_dly [0:CORDIC_LATENCY-1];
+reg        lastx_dly [0:CORDIC_LATENCY-1];
+reg        lasty_dly [0:CORDIC_LATENCY-1];
+integer    i;
+
+always @(posedge out_stream_aclk) begin
+    if (!periph_resetn) begin
+        for (i = 0; i < CORDIC_LATENCY; i = i+1) begin
+            x_dly[i] <= 0;
+            y_dly[i] <= 0;
+            first_dly[i] <= 0;
+            lastx_dly[i] <= 0;
+            lasty_dly[i] <= 0;
+        end
+    end else begin
+        // shift pipeline
+        for (i = 1; i < CORDIC_LATENCY; i = i+1) begin
+            x_dly[i] <= x_dly[i-1];
+            y_dly[i] <= y_dly[i-1];
+            first_dly[i] <= first_dly[i-1];
+            lastx_dly[i] <= lastx_dly[i-1];
+            lasty_dly[i] <= lasty_dly[i-1];
+        end
+        // input to pipeline
+        x_dly[0] <= x;
+        y_dly[0] <= y;
+        first_dly[0] <= first;
+        lastx_dly[0] <= lastx;
+        lasty_dly[0] <= lasty;
+    end
+end
+
+// Aligned signals after latency
+wire [9:0]  x_aligned   = x_dly[CORDIC_LATENCY-1];
+wire [8:0]  y_aligned   = y_dly[CORDIC_LATENCY-1];
+wire        first_aligned = first_dly[CORDIC_LATENCY-1];
+wire        lastx_aligned = lastx_dly[CORDIC_LATENCY-1];
+wire        lasty_aligned = lasty_dly[CORDIC_LATENCY-1];
+
+
+// wave computation using CORDIC magnitude
+wire [15:0] dist1 = cordic_magn1;   // direct from CORDIC
+wire [15:0] dist2 = cordic_magn2;
+
+// reg file access
+wire [7:0] current_time   = regfile[0][7:0];
+wire [15:0] wave_front_dist = current_time * SPEED;
+
+wire wave1_arrived = (dist1 <= wave_front_dist);
+wire wave2_arrived = (dist2 <= wave_front_dist);
+wire [15:0] phase1 = wave1_arrived ? (wave_front_dist - dist1) : 16'd0;
+wire [15:0] phase2 = wave2_arrived ? (wave_front_dist - dist2) : 16'd0;
+
 
 function signed [3:0] sine_lut;
     input [3:0] phase;
@@ -202,7 +311,9 @@ function signed [3:0] sine_lut;
 endfunction
 
 // Grid overlay
-wire is_grid_line = ((x[5:0] == 6'b000000) || (y[5:0] == 6'b000000));
+wire is_grid_line = ((x_aligned[5:0] == 6'b000000) || (y_aligned[5:0] == 6'b000000));
+
+/* OLD CODE FROM NON CORDIC Ver.
 
 // Time from register
 wire [31:0]  current_time   = regfile[0];
@@ -216,21 +327,13 @@ wire [9:0] dist1  = max_d1 + ((min_d1 * 10'd3) >> 3);
 
 wire wave1_arrived = (dist1 <= wave_front_dist);
 wire [31:0] phase1 = wave1_arrived ? (wave_front_dist - dist1) : 32'd0;
+*/
 
 wire signed [3:0] raw_amp1  = sine_lut(phase1[5:2]);
 wire [2:0] atten_shift1 = dist1[9:7];
 wire [3:0] raw_abs1  = (raw_amp1 < 0) ? -raw_amp1 : raw_amp1;
 wire [3:0] atten_abs1 = raw_abs1 >> atten_shift1;
 wire signed [3:0] final_amp1 = (raw_amp1 < 0) ? -atten_abs1 : atten_abs1;
-
-wire [9:0] dx2 = (x > SRC2_X) ? (x - SRC2_X) : (SRC2_X - x);
-wire [8:0] dy2 = (y > SRC2_Y) ? (y - SRC2_Y) : (SRC2_Y - y);
-wire [9:0] max_d2 = (dx2 > dy2) ? dx2 : dy2;
-wire [9:0] min_d2 = (dx2 > dy2) ? dy2 : dx2;
-wire [9:0] dist2 = max_d2 + ((min_d2 * 10'd3) >> 3);
-
-wire wave2_arrived = (dist2 <= wave_front_dist);
-wire [31:0] phase2 = wave2_arrived ? (wave_front_dist - dist2) : 32'd0;
 
 wire signed [3:0] raw_amp2  = sine_lut(phase2[5:2]);
 wire [2:0] atten_shift2 = dist2[9:7];
@@ -260,10 +363,10 @@ packer pixel_packer(
     .aclk(out_stream_aclk),
     .aresetn(periph_resetn),
     .r(r), .g(g), .b(b),
-    .eol(lastx),
+    .eol(lastx_aligned),
     .in_stream_ready(ready),
     .valid(valid_int),
-    .sof(first),
+    .sof(first_aligned),
     .out_stream_tdata(out_stream_tdata),
     .out_stream_tkeep(out_stream_tkeep),
     .out_stream_tlast(out_stream_tlast),
