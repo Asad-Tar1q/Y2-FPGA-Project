@@ -171,19 +171,45 @@ def _generate_frame() -> np.ndarray:
         theta_0 = float(a_dict.get("theta_0", 0.0))
         a_val   = float(a_dict.get("a", 0.0))
 
-        field += _source_contribution(cx, cy, amp, freq, theta_0, a_val, t)
+        # Real source — block it on the far side of every reflector
+        src_field = _source_contribution(cx, cy, amp, freq, theta_0, a_val, t)
+        for w in walls:
+            if w["type"] != 0:
+                continue
+            x1, y1, x2, y2 = w["x1"], w["y1"], w["x2"], w["y2"]
+            if abs(x2 - x1) >= abs(y2 - y1):   # horizontal wall at y=y1
+                if cy <= y1:
+                    src_field[_YY > y1] = 0.0   # source above, shadow below
+                else:
+                    src_field[_YY < y1] = 0.0   # source below, shadow above
+            else:                                # vertical wall at x=x1
+                if cx <= x1:
+                    src_field[_XX > x1] = 0.0   # source left, shadow right
+                else:
+                    src_field[_XX < x1] = 0.0   # source right, shadow left
+        field += src_field
 
-        # Reflectors: add image source mirrored across each reflector wall
+        # Image sources — one per reflector, masked to source's half-plane only
         for w in walls:
             if w["type"] != 0:
                 continue
             x1, y1, x2, y2 = w["x1"], w["y1"], w["x2"], w["y2"]
             if abs(x2 - x1) >= abs(y2 - y1):   # horizontal wall at y=y1
                 img_cy = 2.0 * y1 - cy
-                field += _source_contribution(cx, img_cy, amp, freq, theta_0, a_val, t)
+                img = _source_contribution(cx, img_cy, amp, freq, theta_0, a_val, t)
+                if cy <= y1:
+                    img[_YY > y1] = 0.0         # source above — show image above only
+                else:
+                    img[_YY < y1] = 0.0         # source below — show image below only
+                field += img
             else:                                # vertical wall at x=x1
                 img_cx = 2.0 * x1 - cx
-                field += _source_contribution(img_cx, cy, amp, freq, theta_0, a_val, t)
+                img = _source_contribution(img_cx, cy, amp, freq, theta_0, a_val, t)
+                if cx <= x1:
+                    img[_XX > x1] = 0.0         # source left — show image left only
+                else:
+                    img[_XX < x1] = 0.0         # source right — show image right only
+                field += img
 
     # Absorbers: zero out field on the far side from the average source position
     if ants:
