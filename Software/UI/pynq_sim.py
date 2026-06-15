@@ -57,10 +57,33 @@ def _handle_ctrl(conn, addr):
             while True:
                 if len(buf) < 2:
                     break
-                # Antenna packets: cmd at byte 1, values 0/1/2 — never 3 or 4.
-                # Wall packets:    cmd at byte 0, values 3/4   — never 0, 1, or 2.
-                # Check antenna first (byte 1 is unambiguous regardless of ant_id).
-                if buf[1] in (0, 1, 2):
+                # Wall packets:    cmd at byte 0, values 5/6 — never 0..4.
+                # Antenna packets: cmd at byte 1, values 0/1/2; ant_id at byte 0, values 0..4.
+                # Check walls first: cmd=5/6 is outside ant_id range so it is unambiguous.
+                if buf[0] in (5, 6):
+                    # Wall command — 12-byte packet
+                    if len(buf) < WALL_SIZE:
+                        break
+                    raw = buf[:WALL_SIZE]
+                    buf = buf[WALL_SIZE:]
+                    cmd, wtype, x1, y1, x2, y2 = struct.unpack(WALL_FMT, raw)
+                    if cmd == 6:
+                        with _ant_lock:
+                            # x1 field holds wall_id for delete
+                            _walls.pop(x1, None)
+                        print(f"  [PL] delete wall {x1}")
+                    else:
+                        with _ant_lock:
+                            wall_id = _wall_next_id
+                            _wall_next_id += 1
+                            _walls[wall_id] = {
+                                "x1": int(x1), "y1": int(y1),
+                                "x2": int(x2), "y2": int(y2),
+                                "type": int(wtype),
+                            }
+                        tname = "reflect" if wtype == 0 else "absorb"
+                        print(f"  [PL] wall {wall_id}: ({x1},{y1})→({x2},{y2}) {tname}")
+                elif buf[1] in (0, 1, 2):
                     # Antenna command — 20-byte packet
                     if len(buf) < CTRL_SIZE:
                         break
@@ -93,29 +116,6 @@ def _handle_ctrl(conn, addr):
                               f"amp={amplitude:.3f}  freq=×{frequency:.3f}  "
                               f"θ={theta_0:.3f}  a={a:.3f}  "
                               f"pos=({int(x)},{int(y)})")
-                elif buf[0] in (3, 4):
-                    # Wall command — 12-byte packet
-                    if len(buf) < WALL_SIZE:
-                        break
-                    raw = buf[:WALL_SIZE]
-                    buf = buf[WALL_SIZE:]
-                    cmd, wtype, x1, y1, x2, y2 = struct.unpack(WALL_FMT, raw)
-                    if cmd == 4:
-                        with _ant_lock:
-                            # x1 field holds wall_id for delete
-                            _walls.pop(x1, None)
-                        print(f"  [PL] delete wall {x1}")
-                    else:
-                        with _ant_lock:
-                            wall_id = _wall_next_id
-                            _wall_next_id += 1
-                            _walls[wall_id] = {
-                                "x1": int(x1), "y1": int(y1),
-                                "x2": int(x2), "y2": int(y2),
-                                "type": int(wtype),
-                            }
-                        tname = "reflect" if wtype == 0 else "absorb"
-                        print(f"  [PL] wall {wall_id}: ({x1},{y1})→({x2},{y2}) {tname}")
                 else:
                     # Unknown byte — discard and re-sync
                     print(f"  [PL] unexpected byte 0x{buf[0]:02x}, skipping")

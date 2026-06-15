@@ -20,6 +20,7 @@ import struct
 import numpy as np
 import glfw
 import moderngl
+import OpenGL.GL as gl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib
@@ -215,7 +216,7 @@ def send_pause_toggle():
 
 def send_wall(wall):
     wtype = 0 if wall.wall_type == "reflect" else 1
-    msg = struct.pack(WALL_FMT, 3, wtype,
+    msg = struct.pack(WALL_FMT, 5, wtype,
                       int(wall.x1) & 0xFFFF, int(wall.y1) & 0xFFFF,
                       int(wall.x2) & 0xFFFF, int(wall.y2) & 0xFFFF)
     with _ctrl_lock:
@@ -227,7 +228,7 @@ def send_wall(wall):
 
 
 def send_delete_wall(wall_id):
-    msg = struct.pack(WALL_FMT, 4, 0, wall_id & 0xFFFF, 0, 0, 0)
+    msg = struct.pack(WALL_FMT, 6, 0, wall_id & 0xFFFF, 0, 0, 0)
     with _ctrl_lock:
         if _ctrl_sock:
             try:
@@ -550,8 +551,9 @@ class WaveFormApp:
                 self.sel = (self.sel + 1) % len(self.antennas)
             elif key == glfw.KEY_DELETE:
                 if self._draw_mode == "wall" and self.sel_wall is not None:
-                    send_delete_wall(self.walls[self.sel_wall].id)
-                    del self.walls[self.sel_wall]
+                    if 0 <= self.sel_wall < len(self.walls):
+                        send_delete_wall(self.walls[self.sel_wall].id)
+                        del self.walls[self.sel_wall]
                     self.sel_wall = None
                 elif self._draw_mode == "antenna":
                     self._del_ant()
@@ -741,6 +743,11 @@ class WaveFormApp:
             lines += [nx1, ny1, nx2, ny2]
 
         if not lines:
+            self.ctx.disable(moderngl.BLEND)
+            return
+
+        if len(lines) * 4 > self.wall_vbo.size:
+            self.ctx.disable(moderngl.BLEND)
             return
 
         self.wall_vbo.write(np.array(lines, dtype='f4').tobytes())
@@ -1154,6 +1161,16 @@ class WaveFormApp:
             self._draw_grid()
             self._draw_dots()
             self._draw_walls()
+
+            # ModernGL does not drain the GL error queue. Drain it here so that
+            # PyOpenGL's error-checking wrappers (used by pyimgui) don't raise
+            # on stale errors — most likely GL_INVALID_VALUE from glLineWidth(2.5)
+            # on core-profile contexts that only support width=1.0.
+            while gl.glGetError() != gl.GL_NO_ERROR:
+                pass
+            gl.glUseProgram(0)
+            gl.glBindVertexArray(0)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
             imgui.new_frame()
             self._draw_panel()
