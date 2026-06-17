@@ -20,6 +20,7 @@ import struct
 import numpy as np
 import glfw
 import moderngl
+import OpenGL.GL as gl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib
@@ -44,6 +45,11 @@ MIN_SEP     = 26
 HOST       = "127.0.0.1"
 FRAME_PORT = 5000
 CTRL_PORT  = 5001
+CTRL_FMT   = ">BBHHffff"
+CTRL_SIZE  = struct.calcsize(CTRL_FMT)   # 20 bytes
+WALL_FMT   = ">BBHHHHxx"
+WALL_SIZE  = struct.calcsize(WALL_FMT)   # 12 bytes
+SEND_HZ    = 30
 
 SOURCE_COLS_F = [
     (0.000, 0.784, 0.863),
@@ -68,8 +74,12 @@ class Antenna:
         self.y         = float(y)
         self.amplitude = float(amplitude)
         self.frequency = float(frequency)
-        self.theta_0   = 0.0
-        self.a         = 0.0
+        self.theta_0     = 0.0
+        self.a           = 0.0
+        self.moving      = False
+        self.move_a      = (self.x, self.y)
+        self.move_b      = (self.x, self.y)
+        self.move_period = 3.0
 
     @property
     def colour(self):
@@ -78,6 +88,21 @@ class Antenna:
     @property
     def label(self):
         return f"A{self.id + 1}"
+
+
+# ── Wall model ─────────────────────────────────────────────────────────────────
+_next_wall_id = 0
+
+class Wall:
+    def __init__(self, x1, y1, x2, y2, wall_type="reflect"):
+        global _next_wall_id
+        self.id        = _next_wall_id
+        _next_wall_id += 1
+        self.x1        = float(x1)
+        self.y1        = float(y1)
+        self.x2        = float(x2)
+        self.y2        = float(y2)
+        self.wall_type = wall_type   # "reflect" or "absorb"
 
 
 # ── Networking ─────────────────────────────────────────────────────────────────
@@ -172,6 +197,29 @@ def send_snapshot(antennas, paused=False):
             try:
                 _ctrl_sock.sendall(pkt)
             except OSError:
+                pass
+
+
+def send_wall(wall):
+    wtype = 0 if wall.wall_type == "reflect" else 1
+    msg = struct.pack(WALL_FMT, 5, wtype,
+                      int(wall.x1) & 0xFFFF, int(wall.y1) & 0xFFFF,
+                      int(wall.x2) & 0xFFFF, int(wall.y2) & 0xFFFF)
+    with _ctrl_lock:
+        if _ctrl_sock:
+            try:
+                _ctrl_sock.sendall(msg)
+            except Exception:
+                pass
+
+
+def send_delete_wall(wall_id):
+    msg = struct.pack(WALL_FMT, 6, 0, wall_id & 0xFFFF, 0, 0, 0)
+    with _ctrl_lock:
+        if _ctrl_sock:
+            try:
+                _ctrl_sock.sendall(msg)
+            except Exception:
                 pass
 
 
@@ -280,6 +328,15 @@ class WaveFormApp:
         self._disp_fps    = 0.0
         self._disp_n      = 0
         self._disp_t      = time.monotonic()
+        self._move_time   = 0.0
+        self._prev_t      = time.monotonic()
+
+        self.walls            = []
+        self.sel_wall         = None
+        self._draw_mode       = "antenna"
+        self._wall_type_new   = "reflect"
+        self._wall_drag_start = None
+        self._wall_drag_cur   = None
 
     # ── Coordinate helpers (depend on current window size) ─────────────────────
     def _field_w(self):
@@ -341,6 +398,11 @@ class WaveFormApp:
         self.dot_vbo = ctx.buffer(reserve=6 * 4 * 4)
         self.dot_vao = ctx.vertex_array(
             self.circle_prog, [(self.dot_vbo, '2f 2f', 'in_vert', 'in_uv')])
+
+        # Walls — up to 128 committed walls + 1 preview = 129 lines × 2 endpoints × 2 floats × 4 bytes
+        self.wall_vbo = ctx.buffer(reserve=256 * 2 * 2 * 4)
+        self.wall_vao = ctx.vertex_array(
+            self.col_prog, [(self.wall_vbo, '2f', 'in_vert')])
 
         # Write initial geometry
         self._rebuild_geometry()
@@ -411,8 +473,55 @@ class WaveFormApp:
                 if self._drag_ant is not None:
                     send_snapshot(self.antennas, _paused)
                 self._drag_ant = None
+            fx = max(0.0, min(FIELD_W - 1, fx))
+            fy = max(0.0, min(FIELD_H - 1, fy))
+
+            if self._draw_mode == "antenna":
+                if action == glfw.PRESS:
+                    hit = self._ant_at(fx, fy)
+                    if hit is not None:
+                        self.sel       = hit
+                        self._drag_ant = hit
+                    elif self.antennas:
+                        ant = self.antennas[self.sel]
+                        if not self._overlaps_any(fx, fy, self.sel):
+                            ant.x, ant.y = fx, fy
+                            send_antenna(ant, force=True)
+                elif action == glfw.RELEASE:
+                    if self._drag_ant is not None:
+                        send_antenna(self.antennas[self._drag_ant], force=True)
+                    self._drag_ant = None
+
+            elif self._draw_mode == "wall":
+                if action == glfw.PRESS:
+                    hit = self._wall_at(fx, fy)
+                    if hit is not None:
+                        self.sel_wall = hit
+                    else:
+                        self._wall_drag_start = (fx, fy)
+                        self._wall_drag_cur   = (fx, fy)
+                        self.sel_wall = None
+                elif action == glfw.RELEASE:
+                    if self._wall_drag_start is not None:
+                        x1s, y1s, x2s, y2s = _snap_wall(
+                            self._wall_drag_start[0], self._wall_drag_start[1], fx, fy)
+                        if abs(x2s - x1s) + abs(y2s - y1s) > 10:
+                            w = Wall(x1s, y1s, x2s, y2s, self._wall_type_new)
+                            self.walls.append(w)
+                            self.sel_wall = len(self.walls) - 1
+                            send_wall(w)
+                    self._wall_drag_start = None
+                    self._wall_drag_cur   = None
 
     def _cursor_pos_cb(self, win, sx, sy):
+        if self._draw_mode == "wall":
+            if self._wall_drag_start is not None:
+                fx, fy = self._screen_to_field(sx, sy)
+                self._wall_drag_cur = (
+                    max(0.0, min(FIELD_W - 1, fx)),
+                    max(0.0, min(FIELD_H - 1, fy))
+                )
+            return
         if self._drag_ant is not None and sx < self._field_w():
             a  = self.antennas[self._drag_ant]
             fx, fy = self._screen_to_field(sx, sy)
@@ -429,13 +538,23 @@ class WaveFormApp:
         if action == glfw.PRESS:
             if key == glfw.KEY_F11:
                 self._toggle_fullscreen()
+            elif key == glfw.KEY_ESCAPE:
+                self._draw_mode       = "antenna"
+                self._wall_drag_start = None
+                self._wall_drag_cur   = None
             elif key == glfw.KEY_SPACE:
                 _paused = not _paused
                 send_snapshot(self.antennas, _paused)
             elif key == glfw.KEY_TAB and self.antennas:
                 self.sel = (self.sel + 1) % len(self.antennas)
             elif key == glfw.KEY_DELETE:
-                self._del_ant()
+                if self._draw_mode == "wall" and self.sel_wall is not None:
+                    if 0 <= self.sel_wall < len(self.walls):
+                        send_delete_wall(self.walls[self.sel_wall].id)
+                        del self.walls[self.sel_wall]
+                    self.sel_wall = None
+                elif self._draw_mode == "antenna":
+                    self._del_ant()
 
     def _toggle_fullscreen(self):
         if glfw.get_window_monitor(self.window):
@@ -501,6 +620,7 @@ class WaveFormApp:
         for ant in self.antennas:
             send_delete(ant.id)
         self.antennas.clear()
+        self._move_time = 0.0
 
         cx, cy = FIELD_W / 2.0, FIELD_H / 2.0
         if name == "single":
@@ -537,6 +657,29 @@ class WaveFormApp:
 
         self.sel = 0
         send_all(self.antennas)
+
+    def _wall_at(self, fx, fy, thresh=8.0):
+        """Return index of wall whose midpoint is within thresh px, or None."""
+        for i, w in enumerate(self.walls):
+            mx = (w.x1 + w.x2) / 2.0
+            my = (w.y1 + w.y2) / 2.0
+            if abs(fx - mx) <= thresh and abs(fy - my) <= thresh:
+                return i
+        return None
+
+    def _update_moving_sources(self, dt):
+        self._move_time += dt
+        for ant in self.antennas:
+            if not ant.moving:
+                continue
+            T     = max(ant.move_period, 0.1)
+            phase = (self._move_time % T) / T
+            t_tri = 1.0 - abs(2.0 * phase - 1.0)
+            ax, ay = ant.move_a
+            bx, by = ant.move_b
+            ant.x = ax + (bx - ax) * t_tri
+            ant.y = ay + (by - ay) * t_tri
+            send_antenna(ant)
 
     # ── GL rendering ──────────────────────────────────────────────────────────
     def _draw_field(self, frame):
@@ -580,6 +723,51 @@ class WaveFormApp:
             self.circle_prog['u_inner'].value  = 0.0
             self.dot_vao.render(moderngl.TRIANGLES, vertices=6)
 
+        self.ctx.disable(moderngl.BLEND)
+
+    def _draw_walls(self):
+        lines = []
+        for w in self.walls:
+            nx1, ny1 = self._field_to_ndc(w.x1, w.y1)
+            nx2, ny2 = self._field_to_ndc(w.x2, w.y2)
+            lines += [nx1, ny1, nx2, ny2]
+        if self._wall_drag_start and self._wall_drag_cur:
+            sx, sy = self._wall_drag_start
+            ex, ey = self._wall_drag_cur
+            x1s, y1s, x2s, y2s = _snap_wall(sx, sy, ex, ey)
+            nx1, ny1 = self._field_to_ndc(x1s, y1s)
+            nx2, ny2 = self._field_to_ndc(x2s, y2s)
+            lines += [nx1, ny1, nx2, ny2]
+
+        if not lines:
+            self.ctx.disable(moderngl.BLEND)
+            return
+
+        if len(lines) * 4 > self.wall_vbo.size:
+            self.ctx.disable(moderngl.BLEND)
+            return
+
+        self.wall_vbo.write(np.array(lines, dtype='f4').tobytes())
+
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self.ctx.line_width = 2.5
+
+        for i, w in enumerate(self.walls):
+            if i == self.sel_wall:
+                col = (1.0, 1.0, 1.0, 1.0)
+            elif w.wall_type == "reflect":
+                col = (0.863, 0.275, 0.275, 1.0)
+            else:
+                col = (0.400, 0.400, 0.400, 0.9)
+            self.col_prog['u_colour'].value = col
+            self.wall_vao.render(moderngl.LINES, vertices=2, first=i * 2)
+
+        if self._wall_drag_start and self._wall_drag_cur:
+            self.col_prog['u_colour'].value = (1.0, 0.9, 0.0, 0.8)
+            self.wall_vao.render(moderngl.LINES, vertices=2, first=len(self.walls) * 2)
+
+        self.ctx.line_width = 1.0
         self.ctx.disable(moderngl.BLEND)
 
     # ── ImGui panel ────────────────────────────────────────────────────────────
@@ -657,6 +845,74 @@ class WaveFormApp:
         if imgui.button("Interference##p", width=btn_w):
             self._apply_preset("interference")
         imgui.pop_style_color(3)
+
+        imgui.separator()
+
+        # Draw-mode toggle
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+        imgui.text("DRAW MODE")
+        imgui.pop_style_color()
+
+        half_w = (PANEL_W - 24) // 2
+        if self._draw_mode == "antenna":
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.000, 0.784, 0.863, 0.4)
+        else:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.043, 0.098, 0.161, 1.0)
+        if imgui.button("Antenna##mode", width=half_w):
+            self._draw_mode = "antenna"
+        imgui.pop_style_color()
+        imgui.same_line()
+        if self._draw_mode == "wall":
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.000, 0.784, 0.863, 0.4)
+        else:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.043, 0.098, 0.161, 1.0)
+        if imgui.button("Wall##mode", width=half_w):
+            self._draw_mode = "wall"
+        imgui.pop_style_color()
+
+        if self._draw_mode == "wall":
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("Wall type:")
+            imgui.pop_style_color()
+            imgui.same_line()
+            if imgui.radio_button("Reflect##wt", self._wall_type_new == "reflect"):
+                self._wall_type_new = "reflect"
+            imgui.same_line()
+            if imgui.radio_button("Absorb##wt", self._wall_type_new == "absorb"):
+                self._wall_type_new = "absorb"
+
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("WALLS")
+            imgui.pop_style_color()
+
+            for i, w in enumerate(self.walls):
+                col = (0.863, 0.275, 0.275, 1.0) if w.wall_type == "reflect" \
+                      else (0.600, 0.600, 0.600, 1.0)
+                orient = "H" if abs(w.x2 - w.x1) >= abs(w.y2 - w.y1) else "V"
+                label = f"W{w.id+1} [{orient}] {w.wall_type[:3]}##wsel{i}"
+                imgui.push_style_color(imgui.COLOR_TEXT, *col)
+                clicked, _ = imgui.selectable(label, i == self.sel_wall,
+                                              width=PANEL_W - 60)
+                imgui.pop_style_color()
+                if clicked:
+                    self.sel_wall = i
+                imgui.same_line()
+                imgui.push_style_color(imgui.COLOR_TEXT,   0.863, 0.275, 0.275, 1.0)
+                imgui.push_style_color(imgui.COLOR_BUTTON, 0.043, 0.098, 0.161, 1.0)
+                if imgui.button(f"x##wdel{i}", width=24):
+                    send_delete_wall(w.id)
+                    del self.walls[i]
+                    if self.sel_wall == i:
+                        self.sel_wall = None
+                    elif self.sel_wall is not None and self.sel_wall > i:
+                        self.sel_wall -= 1
+                    imgui.pop_style_color(2)
+                    break   # list mutated; ImGui is done for this frame
+                imgui.pop_style_color(2)
+
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.502, 0.502, 0.502, 1.0)
+            imgui.text("Click-drag on field to draw")
+            imgui.pop_style_color()
 
         imgui.separator()
 
@@ -746,6 +1002,57 @@ class WaveFormApp:
 
             imgui.pop_item_width()
 
+            imgui.separator()
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+            imgui.text("MOTION")
+            imgui.pop_style_color()
+
+            changed, v = imgui.checkbox("Moving##mov", ant.moving)
+            if changed:
+                ant.moving = v
+                if v:
+                    if ant.move_a == ant.move_b:
+                        ant.move_a = (ant.x, ant.y)
+                        ant.move_b = (ant.x + 80.0, ant.y)
+                else:
+                    ant.x, ant.y = ant.move_a
+                    send_antenna(ant, force=True)
+
+            if ant.moving:
+                imgui.push_item_width(PANEL_W - 32)
+
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+                imgui.text("Period (s)")
+                imgui.pop_style_color()
+                changed, v = imgui.slider_float("##period", ant.move_period,
+                                                0.5, 20.0, format="%.1f s")
+                if changed:
+                    ant.move_period = v
+
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+                imgui.text("Point A")
+                imgui.pop_style_color()
+                ax, ay = ant.move_a
+                c1, vx = imgui.slider_float("##ax", ax, 0.0, float(FIELD_W),
+                                            format="x=%.0f")
+                c2, vy = imgui.slider_float("##ay", ay, 0.0, float(FIELD_H),
+                                            format="y=%.0f")
+                if c1 or c2:
+                    ant.move_a = (vx if c1 else ax, vy if c2 else ay)
+
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
+                imgui.text("Point B")
+                imgui.pop_style_color()
+                bx, by = ant.move_b
+                c1, vx = imgui.slider_float("##bx", bx, 0.0, float(FIELD_W),
+                                            format="x=%.0f")
+                c2, vy = imgui.slider_float("##by", by, 0.0, float(FIELD_H),
+                                            format="y=%.0f")
+                if c1 or c2:
+                    ant.move_b = (vx if c1 else bx, vy if c2 else by)
+
+                imgui.pop_item_width()
+
             imgui.text(f"x {int(ant.x):>3}  y {int(ant.y):>3}")
 
             # Minimap
@@ -807,6 +1114,25 @@ class WaveFormApp:
         imgui.text(f"recv {_recv_fps:4.0f} fps")
         imgui.pop_style_color()
 
+        # Motion path overlay — A/B markers and connecting line for moving antennas
+        try:
+            overlay = imgui.get_overlay_draw_list()
+        except AttributeError:
+            overlay = imgui.get_window_draw_list()
+        fw = self._field_w()
+        for ant in self.antennas:
+            if not ant.moving:
+                continue
+            col = ant.colour
+            cu32 = imgui.get_color_u32_rgba(col[0], col[1], col[2], 0.6)
+            ax_s = ant.move_a[0] / FIELD_W * fw
+            ay_s = ant.move_a[1] / FIELD_H * self.win_h
+            bx_s = ant.move_b[0] / FIELD_W * fw
+            by_s = ant.move_b[1] / FIELD_H * self.win_h
+            overlay.add_circle(ax_s, ay_s, 5, cu32, 8)
+            overlay.add_circle(bx_s, by_s, 5, cu32, 8)
+            overlay.add_line(ax_s, ay_s, bx_s, by_s, cu32)
+
         imgui.end()
         imgui.pop_style_var(3)
         imgui.pop_style_color(10)
@@ -819,6 +1145,10 @@ class WaveFormApp:
 
         while not glfw.window_should_close(self.window):
             glfw.poll_events()
+            now_t = time.monotonic()
+            dt    = now_t - self._prev_t
+            self._prev_t = now_t
+            self._update_moving_sources(dt)
             self.impl.process_inputs()
 
             self._disp_n += 1
@@ -838,6 +1168,17 @@ class WaveFormApp:
             self._draw_field(frame)
             self._draw_grid()
             self._draw_dots()
+            self._draw_walls()
+
+            # ModernGL does not drain the GL error queue. Drain it here so that
+            # PyOpenGL's error-checking wrappers (used by pyimgui) don't raise
+            # on stale errors — most likely GL_INVALID_VALUE from glLineWidth(2.5)
+            # on core-profile contexts that only support width=1.0.
+            while gl.glGetError() != gl.GL_NO_ERROR:
+                pass
+            gl.glUseProgram(0)
+            gl.glBindVertexArray(0)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
             imgui.new_frame()
             self._draw_panel()
@@ -848,6 +1189,14 @@ class WaveFormApp:
 
         self.impl.shutdown()
         glfw.terminate()
+
+
+def _snap_wall(x1, y1, x2, y2):
+    """Snap drag to horizontal or vertical based on dominant axis."""
+    if abs(x2 - x1) >= abs(y2 - y1):
+        return x1, y1, x2, y1   # horizontal — lock y to start
+    else:
+        return x1, y1, x1, y2   # vertical   — lock x to start
 
 
 def _quad_verts(cx, cy, rx, ry):
