@@ -8,7 +8,7 @@ import traceback
 import numpy as np
 from pynq import Overlay, allocate
 
-BITFILE = "/home/xilinx/jupyter_notebooks/EMWaves/test4/base.bit"
+BITFILE = "/home/xilinx/jupyter_notebooks/EMWaves/test7/base.bit"
 PIXGEN_PATH = "pixel_generator_0"
 DMA_PATH = "axi_dma_0"
 
@@ -19,9 +19,10 @@ CTRL_PORT = 5001
 WIDTH = 640
 HEIGHT = 480
 FRAME_BYTES = WIDTH * HEIGHT
+FRAME_HEADER = struct.pack(">I", FRAME_BYTES)
 
-MAX_HW_SOURCES = 4
-MAX_WALLS = 2
+MAX_HW_SOURCES = 8
+MAX_WALLS = 4
 REG_TIME = 0
 REG_CTRL = 1
 SRC_BASE = 4
@@ -31,9 +32,9 @@ WALL_STRIDE = 3
 
 SCENE_MAGIC = b"WFSC"
 SCENE_VERSION = 1
-SCENE_HDR_FMT = ">4sBBBBH"          # magic, version, flags, n_src, n_wall, reserved
-SRC_REC_FMT = ">hhhhBBBBbbBB"       # x,y,vx,vy,amp,freq,phase,dir_gain,dirx,diry,flags,wall_id
-WALL_REC_FMT = ">hhhhBBBB"          # x1,y1,x2,y2,enable,type,gain,phase_inv
+SCENE_HDR_FMT = ">4sBBBBH"
+SRC_REC_FMT = ">hhhhBBBBbbBB"
+WALL_REC_FMT = ">hhhhBBBB"
 SCENE_HDR_SIZE = struct.calcsize(SCENE_HDR_FMT)
 SRC_REC_SIZE = struct.calcsize(SRC_REC_FMT)
 WALL_REC_SIZE = struct.calcsize(WALL_REC_FMT)
@@ -41,15 +42,15 @@ WALL_REC_SIZE = struct.calcsize(WALL_REC_FMT)
 state_lock = threading.Lock()
 hw_lock = threading.Lock()
 stop_evt = threading.Event()
+
 paused = False
 frame_time = 0
+sources = []
+walls = []
 
 pixgen = None
 dma = None
-
-# Source record fields kept in hardware-ready integer form.
-sources = []
-walls = []
+_last_regs = {}
 
 
 def i16(v):
@@ -65,23 +66,29 @@ def pack_i16_xy(x, y):
     return ((i16(y) & 0xFFFF) << 16) | (i16(x) & 0xFFFF)
 
 
-def write_reg(index, value):
-    pixgen.write(index * 4, int(value) & 0xFFFFFFFF)
+def write_reg(index, value, force=False):
+    value = int(value) & 0xFFFFFFFF
+    if force or _last_regs.get(index) != value:
+        pixgen.write(index * 4, value)
+        _last_regs[index] = value
 
 
 def clear_hw_scene_locked():
     for i in range(MAX_HW_SOURCES):
         b = SRC_BASE + i * SRC_STRIDE
-        write_reg(b + 0, 0)
-        write_reg(b + 1, 0)
-        write_reg(b + 2, 0)
-        write_reg(b + 3, 0)
+        write_reg(b + 0, 0, True)
+        write_reg(b + 1, 0, True)
+        write_reg(b + 2, 0, True)
+        write_reg(b + 3, 0, True)
 
     for i in range(MAX_WALLS):
         b = WALL_BASE + i * WALL_STRIDE
-        write_reg(b + 0, 0)
-        write_reg(b + 1, 0)
-        write_reg(b + 2, 0)
+        write_reg(b + 0, 0, True)
+        write_reg(b + 1, 0, True)
+        write_reg(b + 2, 0, True)
+
+    write_reg(REG_CTRL, 0, True)
+    write_reg(REG_TIME, 0, True)
 
 
 def write_scene_to_hw():
@@ -90,73 +97,74 @@ def write_scene_to_hw():
         wall_snapshot = list(walls[:MAX_WALLS])
         local_paused = paused
 
+    regs = {}
+
+    for i in range(MAX_HW_SOURCES):
+        b = SRC_BASE + i * SRC_STRIDE
+        if i < len(src_snapshot):
+            s = src_snapshot[i]
+            enable = 1 if s.get("enable", True) else 0
+            moving = 1 if s.get("moving", False) else 0
+            virtual = 1 if s.get("virtual", False) else 0
+            phase_inv = 1 if s.get("phase_inv", False) else 0
+            wall_id = int(s.get("wall_id", 0)) & 0x0F
+            amp = u8(s.get("amp", 0))
+            freq = u8(s.get("freq", 16))
+            phase = u8(s.get("phase", 0))
+            directivity = u8(s.get("directivity", 0))
+            dirx = i16(s.get("dirx", 127)) & 0xFF
+            diry = i16(s.get("diry", 0)) & 0xFF
+            vx = i16(s.get("vx", 0))
+            vy = i16(s.get("vy", 0))
+
+            regs[b + 0] = pack_i16_xy(s.get("x", 0), s.get("y", 0))
+            regs[b + 1] = (enable |
+                           (moving << 1) |
+                           (virtual << 2) |
+                           (phase_inv << 3) |
+                           (wall_id << 4) |
+                           (amp << 8) |
+                           (freq << 16) |
+                           (phase << 24))
+            regs[b + 2] = dirx | (diry << 8) | (directivity << 16)
+            regs[b + 3] = (vx & 0xFFFF) | ((vy & 0xFFFF) << 16)
+        else:
+            regs[b + 0] = 0
+            regs[b + 1] = 0
+            regs[b + 2] = 0
+            regs[b + 3] = 0
+
+    for i in range(MAX_WALLS):
+        b = WALL_BASE + i * WALL_STRIDE
+        if i < len(wall_snapshot):
+            w = wall_snapshot[i]
+            enable = 1 if w.get("enable", True) else 0
+            reflect = 1 if w.get("type", 0) == 1 else 0
+            phase_inv = 1 if w.get("phase_inv", False) else 0
+            gain = u8(w.get("gain", 160))
+            regs[b + 0] = pack_i16_xy(w.get("x1", 0), w.get("y1", 0))
+            regs[b + 1] = pack_i16_xy(w.get("x2", 0), w.get("y2", 0))
+            regs[b + 2] = enable | (reflect << 1) | (phase_inv << 2) | (gain << 8)
+        else:
+            regs[b + 0] = 0
+            regs[b + 1] = 0
+            regs[b + 2] = 0
+
+    ctrl = ((1 if local_paused else 0) |
+            ((len(src_snapshot) & 0xFF) << 8) |
+            ((len(wall_snapshot) & 0xFF) << 16))
+
     with hw_lock:
-        write_reg(REG_CTRL, (1 if local_paused else 0) |
-                  ((len(src_snapshot) & 0xFF) << 8) |
-                  ((len(wall_snapshot) & 0xFF) << 16))
-
-        for i in range(MAX_HW_SOURCES):
-            b = SRC_BASE + i * SRC_STRIDE
-            if i < len(src_snapshot):
-                s = src_snapshot[i]
-                enable = 1 if s.get("enable", True) else 0
-                moving = 1 if s.get("moving", False) else 0
-                virtual = 1 if s.get("virtual", False) else 0
-                phase_inv = 1 if s.get("phase_inv", False) else 0
-                wall_id = int(s.get("wall_id", 0)) & 0x0F
-                amp = u8(s.get("amp", 0))
-                freq = u8(s.get("freq", 16))
-                phase = u8(s.get("phase", 0))
-                directivity = u8(s.get("directivity", 0))
-                dirx = i16(s.get("dirx", 127)) & 0xFF
-                diry = i16(s.get("diry", 0)) & 0xFF
-                vx = i16(s.get("vx", 0))
-                vy = i16(s.get("vy", 0))
-
-                cfg = (enable |
-                       (moving << 1) |
-                       (virtual << 2) |
-                       (phase_inv << 3) |
-                       (wall_id << 4) |
-                       (amp << 8) |
-                       (freq << 16) |
-                       (phase << 24))
-                dirreg = dirx | (diry << 8) | (directivity << 16)
-                velreg = (vx & 0xFFFF) | ((vy & 0xFFFF) << 16)
-
-                write_reg(b + 0, pack_i16_xy(s.get("x", 0), s.get("y", 0)))
-                write_reg(b + 1, cfg)
-                write_reg(b + 2, dirreg)
-                write_reg(b + 3, velreg)
-            else:
-                write_reg(b + 0, 0)
-                write_reg(b + 1, 0)
-                write_reg(b + 2, 0)
-                write_reg(b + 3, 0)
-
-        for i in range(MAX_WALLS):
-            b = WALL_BASE + i * WALL_STRIDE
-            if i < len(wall_snapshot):
-                w = wall_snapshot[i]
-                enable = 1 if w.get("enable", True) else 0
-                reflect = 1 if w.get("type", 0) == 1 else 0
-                phase_inv = 1 if w.get("phase_inv", False) else 0
-                gain = u8(w.get("gain", 160))
-                cfg = enable | (reflect << 1) | (phase_inv << 2) | (gain << 8)
-                write_reg(b + 0, pack_i16_xy(w.get("x1", 0), w.get("y1", 0)))
-                write_reg(b + 1, pack_i16_xy(w.get("x2", 0), w.get("y2", 0)))
-                write_reg(b + 2, cfg)
-            else:
-                write_reg(b + 0, 0)
-                write_reg(b + 1, 0)
-                write_reg(b + 2, 0)
+        for idx in sorted(regs):
+            write_reg(idx, regs[idx])
+        write_reg(REG_CTRL, ctrl)
 
 
 def parse_scene_packet(payload):
     if len(payload) < SCENE_HDR_SIZE:
         raise ValueError("short scene packet")
 
-    magic, version, flags, n_src, n_wall, _reserved = struct.unpack_from(SCENE_HDR_FMT, payload, 0)
+    magic, version, flags, n_src, n_wall, _ = struct.unpack_from(SCENE_HDR_FMT, payload, 0)
     if magic != SCENE_MAGIC:
         raise ValueError("bad scene magic")
     if version != SCENE_VERSION:
@@ -180,9 +188,7 @@ def parse_scene_packet(payload):
             "wall_id": wall_id,
         })
 
-    # Skip any source records beyond the hardware limit.
-    extra_src = max(0, n_src - MAX_HW_SOURCES)
-    pos += extra_src * SRC_REC_SIZE
+    pos += max(0, n_src - MAX_HW_SOURCES) * SRC_REC_SIZE
 
     new_walls = []
     for _ in range(min(n_wall, MAX_WALLS)):
@@ -216,6 +222,7 @@ def recv_exact(conn, n):
 def handle_ctrl(conn, addr):
     global paused, sources, walls
     print(f"[ctrl] connected {addr}")
+    last_payload = None
     try:
         while not stop_evt.is_set():
             header = recv_exact(conn, 4)
@@ -223,6 +230,9 @@ def handle_ctrl(conn, addr):
             if length <= 0 or length > 65536:
                 raise ValueError(f"invalid control packet length {length}")
             payload = recv_exact(conn, length)
+            if payload == last_payload:
+                continue
+            last_payload = payload
             p, s, w = parse_scene_packet(payload)
             with state_lock:
                 paused = p
@@ -251,13 +261,18 @@ def ctrl_server():
     while not stop_evt.is_set():
         try:
             conn, addr = srv.accept()
-            try:
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(target=handle_ctrl, args=(conn, addr), daemon=True).start()
         except OSError:
             break
+        except Exception:
+            traceback.print_exc()
+            time.sleep(0.2)
+
+
+def send_frame(conn, view):
+    conn.sendall(FRAME_HEADER)
+    conn.sendall(view)
 
 
 def frame_server():
@@ -270,44 +285,58 @@ def frame_server():
 
     buf_a = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
     buf_b = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
-    active = buf_a
+    bufs = [buf_a, buf_b]
+    views = [memoryview(buf_a.reshape(FRAME_BYTES)), memoryview(buf_b.reshape(FRAME_BYTES))]
 
     while not stop_evt.is_set():
         conn, addr = srv.accept()
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
         except Exception:
             pass
         print(f"[frame] connected {addr}")
+
         frames = 0
         t0 = time.monotonic()
         dma_total = 0.0
         tcp_total = 0.0
+        idx = 0
+        transfer_active = False
+
         try:
+            with hw_lock:
+                write_reg(REG_TIME, frame_time, True)
+            dma.recvchannel.transfer(bufs[idx])
+            transfer_active = True
+
             while not stop_evt.is_set():
+                t_dma0 = time.perf_counter()
+                dma.recvchannel.wait()
+                transfer_active = False
+                t_dma1 = time.perf_counter()
+
+                done_idx = idx
+                idx ^= 1
+
                 with state_lock:
                     local_paused = paused
                 if not local_paused:
                     frame_time = (frame_time + 1) & 0xFFFFFFFF
 
                 with hw_lock:
-                    write_reg(REG_TIME, frame_time)
+                    write_reg(REG_TIME, frame_time, True)
 
-                t_dma0 = time.perf_counter()
-                dma.recvchannel.transfer(active)
-                dma.recvchannel.wait()
-                t_dma1 = time.perf_counter()
+                dma.recvchannel.transfer(bufs[idx])
+                transfer_active = True
 
-                payload = active.tobytes()
                 t_tcp0 = time.perf_counter()
-                conn.sendall(struct.pack(">I", len(payload)))
-                conn.sendall(payload)
+                send_frame(conn, views[done_idx])
                 t_tcp1 = time.perf_counter()
 
                 dma_total += t_dma1 - t_dma0
                 tcp_total += t_tcp1 - t_tcp0
                 frames += 1
-                active = buf_b if active is buf_a else buf_a
 
                 now = time.monotonic()
                 if now - t0 >= 1.0:
@@ -322,6 +351,11 @@ def frame_server():
             print("[frame] unexpected exception:")
             traceback.print_exc()
         finally:
+            if transfer_active:
+                try:
+                    dma.recvchannel.wait()
+                except Exception:
+                    pass
             try:
                 conn.close()
             except Exception:
@@ -331,6 +365,7 @@ def frame_server():
 
 def main():
     global pixgen, dma
+    print(f"[regmap] MAX_HW_SOURCES={MAX_HW_SOURCES} MAX_WALLS={MAX_WALLS} WALL_BASE={WALL_BASE}")
     print(f"Loading overlay: {BITFILE}")
     overlay = Overlay(BITFILE)
     pixgen = getattr(overlay, PIXGEN_PATH)
@@ -338,8 +373,6 @@ def main():
 
     with hw_lock:
         clear_hw_scene_locked()
-        write_reg(REG_TIME, 0)
-        write_reg(REG_CTRL, 0)
 
     threading.Thread(target=ctrl_server, daemon=True).start()
     try:

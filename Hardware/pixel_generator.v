@@ -36,11 +36,11 @@ localparam integer X_SIZE = 640;
 localparam integer Y_SIZE = 480;
 localparam integer REG_FILE_AWIDTH = $clog2(REG_FILE_SIZE);
 
-localparam integer MAX_SRC   = 8;
-localparam integer MAX_WALLS = 4;
+localparam integer MAX_SRC   = 4;
+localparam integer MAX_WALLS = 2;
 localparam integer SRC_BASE  = 4;
 localparam integer SRC_STRIDE = 4;
-localparam integer WALL_BASE = SRC_BASE + MAX_SRC * SRC_STRIDE;
+localparam integer WALL_BASE = 36;
 localparam integer WALL_STRIDE = 3;
 
 localparam AWAIT_WADD_AND_DATA = 3'b000;
@@ -185,27 +185,27 @@ function [15:0] approx_dist;
     end
 endfunction
 
-function signed [3:0] sine_lut;
+function signed [4:0] sine_lut;
     input [3:0] phase;
     begin
         case (phase)
-            4'd0:  sine_lut =  4'sd0;
-            4'd1:  sine_lut =  4'sd3;
-            4'd2:  sine_lut =  4'sd5;
-            4'd3:  sine_lut =  4'sd7;
-            4'd4:  sine_lut =  4'sd7;
-            4'd5:  sine_lut =  4'sd5;
-            4'd6:  sine_lut =  4'sd3;
-            4'd7:  sine_lut =  4'sd0;
-            4'd8:  sine_lut = -4'sd3;
-            4'd9:  sine_lut = -4'sd6;
-            4'd10: sine_lut = -4'sd8;
-            4'd11: sine_lut = -4'sd8;
-            4'd12: sine_lut = -4'sd6;
-            4'd13: sine_lut = -4'sd3;
-            4'd14: sine_lut = -4'sd1;
-            4'd15: sine_lut =  4'sd0;
-            default: sine_lut = 4'sd0;
+            4'd0:  sine_lut =  5'sd0;
+            4'd1:  sine_lut =  5'sd3;
+            4'd2:  sine_lut =  5'sd5;
+            4'd3:  sine_lut =  5'sd7;
+            4'd4:  sine_lut =  5'sd8;
+            4'd5:  sine_lut =  5'sd7;
+            4'd6:  sine_lut =  5'sd5;
+            4'd7:  sine_lut =  5'sd3;
+            4'd8:  sine_lut =  5'sd0;
+            4'd9:  sine_lut = -5'sd3;
+            4'd10: sine_lut = -5'sd5;
+            4'd11: sine_lut = -5'sd7;
+            4'd12: sine_lut = -5'sd8;
+            4'd13: sine_lut = -5'sd7;
+            4'd14: sine_lut = -5'sd5;
+            4'd15: sine_lut = -5'sd3;
+            default: sine_lut = 5'sd0;
         endcase
     end
 endfunction
@@ -224,53 +224,22 @@ function axis_wall_hit;
     reg signed [17:0] xmax;
     reg signed [17:0] ymin;
     reg signed [17:0] ymax;
-    reg signed [17:0] dx;
-    reg signed [17:0] dy;
-    reg signed [17:0] wx;
-    reg signed [17:0] wy;
-    reg signed [17:0] dxw;
-    reg signed [17:0] dyw;
-    reg signed [47:0] cross;
-    reg signed [47:0] low;
-    reg signed [47:0] high;
-    reg signed [47:0] tmp;
     begin
-        axis_wall_hit = 1'b0;
         xmin = (x0 < x1) ? x0 : x1;
         xmax = (x0 < x1) ? x1 : x0;
         ymin = (y0 < y1) ? y0 : y1;
         ymax = (y0 < y1) ? y1 : y0;
-        dx = px - sx;
-        dy = py - sy;
+
+        axis_wall_hit = 1'b0;
 
         if (x0 == x1) begin
-            wx = x0;
-            if ((dx != 0) && (((sx <= wx) && (wx <= px)) || ((px <= wx) && (wx <= sx)))) begin
-                dxw = wx - sx;
-                cross = sy * dx + dy * dxw;
-                low   = ymin * dx;
-                high  = ymax * dx;
-                if (low > high) begin
-                    tmp = low;
-                    low = high;
-                    high = tmp;
-                end
-                axis_wall_hit = (cross >= low) && (cross <= high);
-            end
+            axis_wall_hit = (((sx < x0) && (px >= x0)) ||
+                             ((sx > x0) && (px <= x0))) &&
+                            (py >= ymin) && (py <= ymax);
         end else if (y0 == y1) begin
-            wy = y0;
-            if ((dy != 0) && (((sy <= wy) && (wy <= py)) || ((py <= wy) && (wy <= sy)))) begin
-                dyw = wy - sy;
-                cross = sx * dy + dx * dyw;
-                low   = xmin * dy;
-                high  = xmax * dy;
-                if (low > high) begin
-                    tmp = low;
-                    low = high;
-                    high = tmp;
-                end
-                axis_wall_hit = (cross >= low) && (cross <= high);
-            end
+            axis_wall_hit = (((sy < y0) && (py >= y0)) ||
+                             ((sy > y0) && (py <= y0))) &&
+                            (px >= xmin) && (px <= xmax);
         end
     end
 endfunction
@@ -455,11 +424,8 @@ generate
             assign reflector_hit[contrib_wall_i] = wall_en[contrib_wall_i] &&  wall_reflect[contrib_wall_i] && hit;
         end
 
-        wire blocked = |absorber_hit;
-        wire reflector_ok = (src_wall_id[contrib_i][1:0] == 2'd0) ? reflector_hit[0] :
-                            (src_wall_id[contrib_i][1:0] == 2'd1) ? reflector_hit[1] :
-                            (src_wall_id[contrib_i][1:0] == 2'd2) ? reflector_hit[2] :
-                                                                     reflector_hit[3];
+        wire blocked = (|absorber_hit) || ((!src_virtual[contrib_i]) && (|reflector_hit));
+        wire reflector_ok = (src_wall_id[contrib_i][0] == 1'b0) ? reflector_hit[0] : reflector_hit[1];
         wire path_ok = (!src_virtual[contrib_i]) || reflector_ok;
 
         wire [15:0] dist = cordic_magn[contrib_i];
@@ -469,11 +435,13 @@ generate
         wire [7:0] freq_q = (src_freq[contrib_i] == 8'd0) ? 8'd16 : src_freq[contrib_i];
         wire [39:0] phase_mult = phase_delta * freq_q;
         wire [31:0] phase_arg = (phase_mult >> 4) + {24'd0, src_phase[contrib_i]} + (src_phase_inv[contrib_i] ? 32'd32 : 32'd0);
-        wire signed [3:0] raw_amp = sine_lut(phase_arg[5:2]);
-        wire [4:0] raw_abs = (raw_amp < 0) ? -raw_amp : raw_amp;
-        wire [2:0] atten_shift = dist[9:7];
-        wire [4:0] atten_abs = raw_abs >> atten_shift;
-        wire signed [5:0] atten_signed = (raw_amp < 0) ? -$signed({1'b0, atten_abs}) : $signed({1'b0, atten_abs});
+        wire signed [4:0] raw_amp = sine_lut(phase_arg[5:2]);
+        wire signed [5:0] raw_amp_ext = {raw_amp[4], raw_amp};
+        wire [5:0] raw_abs = raw_amp_ext[5] ? -raw_amp_ext : raw_amp_ext;
+        wire [2:0] atten_shift = dist[10:8];
+        wire [5:0] atten_abs = raw_abs >> atten_shift;
+        wire signed [6:0] atten_mag = $signed({1'b0, atten_abs});
+        wire signed [6:0] atten_signed = raw_amp_ext[5] ? -atten_mag : atten_mag;
 
         wire signed [17:0] dx_dir = pix_x_out_s - src_x_out_s;
         wire signed [17:0] dy_dir = pix_y_out_s - src_y_out_s;
@@ -481,8 +449,8 @@ generate
         wire signed [31:0] dot_y = dy_dir * src_diry[contrib_i];
         wire front_lobe = ((dot_x + dot_y) >= 0);
         wire [7:0] dir_gain = front_lobe ? 8'd255 : (8'd255 - src_directivity[contrib_i]);
-        wire signed [15:0] amp_mult = atten_signed * $signed({1'b0, src_amp[contrib_i]});
-        wire signed [24:0] dir_mult = amp_mult * $signed({1'b0, dir_gain});
+        wire signed [16:0] amp_mult = atten_signed * $signed({1'b0, src_amp[contrib_i]});
+        wire signed [25:0] dir_mult = amp_mult * $signed({1'b0, dir_gain});
         wire signed [15:0] scaled = dir_mult >>> 14;
 
         assign contrib[contrib_i] = (src_en[contrib_i] && arrived && !blocked && path_ok) ? scaled : 16'sd0;
@@ -490,13 +458,27 @@ generate
 endgenerate
 
 wire signed [19:0] contrib_sum =
-    contrib[0] + contrib[1] + contrib[2] + contrib[3] +
-    contrib[4] + contrib[5] + contrib[6] + contrib[7];
+    contrib[0] + contrib[1] + contrib[2] + contrib[3];
 
 wire signed [20:0] scalar_tmp = 21'sd128 + contrib_sum;
-wire [7:0] scalar_value = (scalar_tmp < 21'sd0) ? 8'd0 :
-                          (scalar_tmp > 21'sd255) ? 8'd255 :
-                          scalar_tmp[7:0];
+wire [7:0] scalar_wave_value = (scalar_tmp < 21'sd0) ? 8'd0 :
+                               (scalar_tmp > 21'sd255) ? 8'd255 :
+                               scalar_tmp[7:0];
+
+// Optional hardware debug: set regfile[1][24] from software to display
+// the source-0 / wall-0 hit mask directly.
+wire debug_wall_mask = regfile[1][24];
+wire signed [17:0] dbg_sx  = {{2{src_x[0][15]}}, src_x[0]};
+wire signed [17:0] dbg_sy  = {{2{src_y[0][15]}}, src_y[0]};
+wire signed [17:0] dbg_wx0 = {{2{wall_x0[0][15]}}, wall_x0[0]};
+wire signed [17:0] dbg_wy0 = {{2{wall_y0[0][15]}}, wall_y0[0]};
+wire signed [17:0] dbg_wx1 = {{2{wall_x1[0][15]}}, wall_x1[0]};
+wire signed [17:0] dbg_wy1 = {{2{wall_y1[0][15]}}, wall_y1[0]};
+wire debug_wall0_hit = wall_en[0] && axis_wall_hit(dbg_sx, dbg_sy,
+                                                    pix_x_out_s, pix_y_out_s,
+                                                    dbg_wx0, dbg_wy0,
+                                                    dbg_wx1, dbg_wy1);
+wire [7:0] scalar_value = debug_wall_mask ? (debug_wall0_hit ? 8'd255 : 8'd0) : scalar_wave_value;
 
 wire fifo_wr_en = cordic_output_valid && !fifo_full;
 wire packer_ready;

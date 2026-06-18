@@ -20,7 +20,6 @@ import struct
 import numpy as np
 import glfw
 import moderngl
-import OpenGL.GL as gl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib
@@ -119,10 +118,12 @@ WALL_REC_FMT = ">hhhhBBBB"          # x1,y1,x2,y2,enable,type,gain,phase_inv
 _frame_lock   = threading.Lock()
 _latest_frame = None
 _recv_fps     = 0.0
+_frame_seq    = 0
 _ctrl_sock    = None
 _ctrl_lock    = threading.Lock()
 _last_send_t  = 0.0
 _last_ctrl_try = 0.0
+_last_payload  = None
 _paused       = False
 _active_app   = None
 
@@ -139,9 +140,9 @@ def _connect_ctrl():
     global _ctrl_sock
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.0)
+        s.settimeout(0.5)
         s.connect((HOST, CTRL_PORT))
-        s.settimeout(None)
+        s.settimeout(0.5)
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except Exception:
@@ -191,8 +192,21 @@ def _send_ctrl_payload(payload):
         return False
 
 
+def _recv_exact(sock, n):
+    data = bytearray(n)
+    view = memoryview(data)
+    got = 0
+    while got < n:
+        r = sock.recv_into(view[got:], n - got)
+        if r == 0:
+            raise ConnectionResetError
+        got += r
+    return data
+
+
 def _recv_loop():
-    global _latest_frame, _recv_fps
+    global _latest_frame, _recv_fps, _frame_seq
+    expected = FIELD_W * FIELD_H
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -200,32 +214,20 @@ def _recv_loop():
             s.connect((HOST, FRAME_PORT))
             try:
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
             except Exception:
                 pass
             s.settimeout(None)
             print("[client] frame stream connected")
-            buf = b""
             n, t0 = 0, time.monotonic()
             while True:
-                while len(buf) < 4:
-                    chunk = s.recv(4096)
-                    if not chunk:
-                        raise ConnectionResetError
-                    buf += chunk
-                length = struct.unpack(">I", buf[:4])[0]
-                buf    = buf[4:]
-                while len(buf) < length:
-                    chunk = s.recv(65536)
-                    if not chunk:
-                        raise ConnectionResetError
-                    buf += chunk
-                raw   = buf[:length]
-                buf   = buf[length:]
-                if length != FIELD_W * FIELD_H:
+                length = struct.unpack(">I", _recv_exact(s, 4))[0]
+                if length != expected:
                     raise ValueError(f"unexpected frame length {length}")
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(FIELD_H, FIELD_W)
+                raw = _recv_exact(s, length)
                 with _frame_lock:
-                    _latest_frame = frame.copy()
+                    _latest_frame = raw
+                    _frame_seq += 1
                 n += 1
                 now = time.monotonic()
                 if now - t0 >= 1.0:
@@ -339,15 +341,19 @@ def _build_scene_payload(app):
 
 
 def send_scene(force=False):
-    global _last_send_t
+    global _last_send_t, _last_payload
     app = _active_app
     if app is None:
         return
     now = time.monotonic()
     if not force and now - _last_send_t < 1.0 / SEND_HZ:
         return
+    payload = _build_scene_payload(app)
+    if not force and payload == _last_payload:
+        return
     _last_send_t = now
-    _send_ctrl_payload(_build_scene_payload(app))
+    if _send_ctrl_payload(payload):
+        _last_payload = payload
 
 
 def send_antenna(ant, force=False):
@@ -484,6 +490,7 @@ class WaveFormApp:
         self._disp_t      = time.monotonic()
         self._move_time   = 0.0
         self._prev_t      = time.monotonic()
+        self._last_field_frame = None
 
         self.walls            = []
         self.sel_wall         = None
@@ -691,8 +698,8 @@ class WaveFormApp:
             elif key == glfw.KEY_DELETE:
                 if self._draw_mode == "wall" and self.sel_wall is not None:
                     if 0 <= self.sel_wall < len(self.walls):
-                        send_delete_wall(self.walls[self.sel_wall].id)
                         del self.walls[self.sel_wall]
+                        send_scene(force=True)
                     self.sel_wall = None
                 elif self._draw_mode == "antenna":
                     self._del_ant()
@@ -750,17 +757,15 @@ class WaveFormApp:
     def _del_ant(self):
         if not self.antennas:
             return
-        ant = self.antennas[self.sel]
-        send_delete(ant.id)
         del self.antennas[self.sel]
         if self.antennas:
             self.sel = min(self.sel, len(self.antennas) - 1)
         else:
             self.sel = 0
+        send_scene(force=True)
+
 
     def _apply_preset(self, name: str):
-        for ant in self.antennas:
-            send_delete(ant.id)
         self.antennas.clear()
         self._move_time = 0.0
 
@@ -811,25 +816,31 @@ class WaveFormApp:
 
     def _update_moving_sources(self, dt):
         self._move_time += dt
+        changed = False
         for ant in self.antennas:
             if not ant.moving:
                 continue
-            T     = max(ant.move_period, 0.1)
+            T = max(ant.move_period, 0.1)
             phase = (self._move_time % T) / T
             t_tri = 1.0 - abs(2.0 * phase - 1.0)
             ax, ay = ant.move_a
             bx, by = ant.move_b
             ant.x = ax + (bx - ax) * t_tri
             ant.y = ay + (by - ay) * t_tri
-            send_antenna(ant)
+            changed = True
+        if changed:
+            send_scene()
+
 
     # ── GL rendering ──────────────────────────────────────────────────────────
     def _draw_field(self, frame):
-        if frame is not None:
-            self.field_tex.write(frame.tobytes())
+        if frame is not None and frame is not self._last_field_frame:
+            self.field_tex.write(frame)
+            self._last_field_frame = frame
         self.field_tex.use(location=0)
         self.lut_tex.use(location=1)
         self.field_vao.render()
+
 
     def _draw_grid(self):
         self.ctx.enable(moderngl.BLEND)
@@ -893,7 +904,7 @@ class WaveFormApp:
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-        self.ctx.line_width = 2.5
+        self.ctx.line_width = 1.0
 
         for i, w in enumerate(self.walls):
             if i == self.sel_wall:
@@ -1008,15 +1019,26 @@ class WaveFormApp:
         imgui.pop_style_color()
 
         if self._draw_mode == "wall":
+            selected_wall = None
+            if self.sel_wall is not None and 0 <= self.sel_wall < len(self.walls):
+                selected_wall = self.walls[self.sel_wall]
+            current_type = selected_wall.wall_type if selected_wall is not None else self._wall_type_new
+
             imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
             imgui.text("Wall type:")
             imgui.pop_style_color()
             imgui.same_line()
-            if imgui.radio_button("Reflect##wt", self._wall_type_new == "reflect"):
+            if imgui.radio_button("Reflect##wt", current_type == "reflect"):
                 self._wall_type_new = "reflect"
+                if selected_wall is not None:
+                    selected_wall.wall_type = "reflect"
+                    send_scene(force=True)
             imgui.same_line()
-            if imgui.radio_button("Absorb##wt", self._wall_type_new == "absorb"):
+            if imgui.radio_button("Absorb##wt", current_type == "absorb"):
                 self._wall_type_new = "absorb"
+                if selected_wall is not None:
+                    selected_wall.wall_type = "absorb"
+                    send_scene(force=True)
 
             imgui.push_style_color(imgui.COLOR_TEXT, 0.545, 0.659, 0.784, 1.0)
             imgui.text("WALLS")
@@ -1037,8 +1059,8 @@ class WaveFormApp:
                 imgui.push_style_color(imgui.COLOR_TEXT,   0.863, 0.275, 0.275, 1.0)
                 imgui.push_style_color(imgui.COLOR_BUTTON, 0.043, 0.098, 0.161, 1.0)
                 if imgui.button(f"x##wdel{i}", width=24):
-                    send_delete_wall(w.id)
                     del self.walls[i]
+                    send_scene(force=True)
                     if self.sel_wall == i:
                         self.sel_wall = None
                     elif self.sel_wall is not None and self.sel_wall > i:
@@ -1280,7 +1302,6 @@ class WaveFormApp:
             dt    = now_t - self._prev_t
             self._prev_t = now_t
             self._update_moving_sources(dt)
-            send_scene()
             self.impl.process_inputs()
 
             self._disp_n += 1
@@ -1291,8 +1312,6 @@ class WaveFormApp:
 
             with _frame_lock:
                 frame = _latest_frame
-                if frame is not None:
-                    frame = frame.copy()
 
             self.ctx.screen.use()
             self.ctx.clear(0.043, 0.098, 0.161)
@@ -1301,16 +1320,6 @@ class WaveFormApp:
             self._draw_grid()
             self._draw_dots()
             self._draw_walls()
-
-            # ModernGL does not drain the GL error queue. Drain it here so that
-            # PyOpenGL's error-checking wrappers (used by pyimgui) don't raise
-            # on stale errors — most likely GL_INVALID_VALUE from glLineWidth(2.5)
-            # on core-profile contexts that only support width=1.0.
-            while gl.glGetError() != gl.GL_NO_ERROR:
-                pass
-            gl.glUseProgram(0)
-            gl.glBindVertexArray(0)
-            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
             imgui.new_frame()
             self._draw_panel()
