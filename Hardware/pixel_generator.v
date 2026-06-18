@@ -1,6 +1,6 @@
 module pixel_generator #(
-    parameter REG_FILE_SIZE        = 32,
-    parameter AXI_LITE_ADDR_WIDTH  = 8
+    parameter REG_FILE_SIZE       = 64,
+    parameter AXI_LITE_ADDR_WIDTH = 8
 )(
     input               out_stream_aclk,
     input               s_axi_lite_aclk,
@@ -32,214 +32,156 @@ module pixel_generator #(
     input                            s_axi_lite_wvalid
 );
 
-localparam X_SIZE = 640;
-localparam Y_SIZE = 480;
+localparam integer X_SIZE = 640;
+localparam integer Y_SIZE = 480;
+localparam integer REG_FILE_AWIDTH = $clog2(REG_FILE_SIZE);
 
-localparam REG_FILE_AWIDTH = $clog2(REG_FILE_SIZE);
+localparam integer MAX_SRC   = 8;
+localparam integer MAX_WALLS = 4;
+localparam integer SRC_BASE  = 4;
+localparam integer SRC_STRIDE = 4;
+localparam integer WALL_BASE = SRC_BASE + MAX_SRC * SRC_STRIDE;
+localparam integer WALL_STRIDE = 3;
 
 localparam AWAIT_WADD_AND_DATA = 3'b000;
 localparam AWAIT_WDATA         = 3'b001;
 localparam AWAIT_WADD          = 3'b010;
 localparam AWAIT_WRITE         = 3'b100;
 localparam AWAIT_RESP          = 3'b101;
-
 localparam AWAIT_RADD          = 2'b00;
 localparam AWAIT_FETCH         = 2'b01;
 localparam AWAIT_READ          = 2'b10;
-
 localparam AXI_OK              = 2'b00;
 localparam AXI_ERR             = 2'b10;
 
 localparam [31:0] SPEED = 32'd4;
-localparam PROP_SPEED_SHIFT = 2;
+localparam integer FIFO_DEPTH = 512;
+localparam integer FIFO_AWIDTH = $clog2(FIFO_DEPTH);
+localparam integer CORDIC_PIPE_DEPTH = 32;
 
-localparam signed [15:0] MOVING_VX = 16'sd1;
-localparam signed [15:0] MOVING_VY = 16'sd0;
-localparam MOVE_SHIFT = 3;
+reg [31:0] regfile [0:REG_FILE_SIZE-1];
+reg [REG_FILE_AWIDTH-1:0] writeAddr;
+reg [REG_FILE_AWIDTH-1:0] readAddr;
+reg [31:0] readData;
+reg [31:0] writeData;
+reg [1:0]  readState;
+reg [2:0]  writeState;
 
-localparam CORDIC_PIPE_DEPTH = 32;
-localparam FIFO_DEPTH  = 256;
-localparam FIFO_AWIDTH = $clog2(FIFO_DEPTH);
-localparam FIFO_WIDTH  = 26;
+integer axi_i;
 
-function [15:0] abs_diff16;
-    input signed [15:0] a;
-    input signed [15:0] b;
-    reg signed [16:0] d;
+always @(posedge s_axi_lite_aclk) begin
+    if (!axi_resetn) begin
+        readState <= AWAIT_RADD;
+        readAddr  <= {REG_FILE_AWIDTH{1'b0}};
+        readData  <= 32'd0;
+    end else begin
+        readData <= regfile[readAddr];
+        case (readState)
+            AWAIT_RADD: begin
+                if (s_axi_lite_arvalid) begin
+                    readAddr  <= s_axi_lite_araddr[2 +: REG_FILE_AWIDTH];
+                    readState <= AWAIT_FETCH;
+                end
+            end
+            AWAIT_FETCH: readState <= AWAIT_READ;
+            AWAIT_READ: begin
+                if (s_axi_lite_rready)
+                    readState <= AWAIT_RADD;
+            end
+            default: readState <= AWAIT_RADD;
+        endcase
+    end
+end
+
+assign s_axi_lite_arready = (readState == AWAIT_RADD);
+assign s_axi_lite_rresp   = (readAddr < REG_FILE_SIZE) ? AXI_OK : AXI_ERR;
+assign s_axi_lite_rvalid  = (readState == AWAIT_READ);
+assign s_axi_lite_rdata   = readData;
+
+always @(posedge s_axi_lite_aclk) begin
+    if (!axi_resetn) begin
+        writeState <= AWAIT_WADD_AND_DATA;
+        writeAddr  <= {REG_FILE_AWIDTH{1'b0}};
+        writeData  <= 32'd0;
+        for (axi_i = 0; axi_i < REG_FILE_SIZE; axi_i = axi_i + 1)
+            regfile[axi_i] <= 32'd0;
+    end else begin
+        case (writeState)
+            AWAIT_WADD_AND_DATA: begin
+                case ({s_axi_lite_awvalid, s_axi_lite_wvalid})
+                    2'b10: begin
+                        writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
+                        writeState <= AWAIT_WDATA;
+                    end
+                    2'b01: begin
+                        writeData  <= s_axi_lite_wdata;
+                        writeState <= AWAIT_WADD;
+                    end
+                    2'b11: begin
+                        writeData  <= s_axi_lite_wdata;
+                        writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
+                        writeState <= AWAIT_WRITE;
+                    end
+                    default: writeState <= AWAIT_WADD_AND_DATA;
+                endcase
+            end
+            AWAIT_WDATA: begin
+                if (s_axi_lite_wvalid) begin
+                    writeData  <= s_axi_lite_wdata;
+                    writeState <= AWAIT_WRITE;
+                end
+            end
+            AWAIT_WADD: begin
+                if (s_axi_lite_awvalid) begin
+                    writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
+                    writeState <= AWAIT_WRITE;
+                end
+            end
+            AWAIT_WRITE: begin
+                if (writeAddr < REG_FILE_SIZE)
+                    regfile[writeAddr] <= writeData;
+                writeState <= AWAIT_RESP;
+            end
+            AWAIT_RESP: begin
+                if (s_axi_lite_bready)
+                    writeState <= AWAIT_WADD_AND_DATA;
+            end
+            default: writeState <= AWAIT_WADD_AND_DATA;
+        endcase
+    end
+end
+
+assign s_axi_lite_awready = (writeState == AWAIT_WADD_AND_DATA) || (writeState == AWAIT_WADD);
+assign s_axi_lite_wready  = (writeState == AWAIT_WADD_AND_DATA) || (writeState == AWAIT_WDATA);
+assign s_axi_lite_bvalid  = (writeState == AWAIT_RESP);
+assign s_axi_lite_bresp   = (writeAddr < REG_FILE_SIZE) ? AXI_OK : AXI_ERR;
+
+wire [31:0] current_time = regfile[0];
+wire        paused       = regfile[1][0];
+
+function [15:0] abs18;
+    input signed [17:0] v;
     begin
-        d = {a[15], a} - {b[15], b};
-        abs_diff16 = (d < 0) ? -d : d;
+        abs18 = (v < 0) ? -v : v;
+    end
+endfunction
+
+function signed [15:0] sext16;
+    input [15:0] v;
+    begin
+        sext16 = v;
     end
 endfunction
 
 function [15:0] approx_dist;
-    input signed [15:0] ax;
-    input signed [15:0] ay;
-    input signed [15:0] bx;
-    input signed [15:0] by;
-    reg [15:0] dx;
-    reg [15:0] dy;
-    reg [15:0] maxd;
-    reg [15:0] mind;
+    input [15:0] dx;
+    input [15:0] dy;
+    reg [15:0] mx;
+    reg [15:0] mn;
     begin
-        dx = abs_diff16(ax, bx);
-        dy = abs_diff16(ay, by);
-        maxd = (dx > dy) ? dx : dy;
-        mind = (dx > dy) ? dy : dx;
-        approx_dist = maxd + ((mind * 16'd3) >> 3);
-    end
-endfunction
-
-function signed [15:0] clip_x;
-    input signed [31:0] v;
-    begin
-        if (v < 0)
-            clip_x = 16'sd0;
-        else if (v > (X_SIZE - 1))
-            clip_x = X_SIZE - 1;
-        else
-            clip_x = v[15:0];
-    end
-endfunction
-
-function signed [15:0] clip_y;
-    input signed [31:0] v;
-    begin
-        if (v < 0)
-            clip_y = 16'sd0;
-        else if (v > (Y_SIZE - 1))
-            clip_y = Y_SIZE - 1;
-        else
-            clip_y = v[15:0];
-    end
-endfunction
-
-function signed [15:0] moving_x_at_time;
-    input signed [15:0] base;
-    input [31:0] t;
-    reg signed [31:0] step;
-    reg signed [31:0] val;
-    begin
-        step = t >> MOVE_SHIFT;
-        val = {{16{base[15]}}, base} + (step * MOVING_VX);
-        moving_x_at_time = clip_x(val);
-    end
-endfunction
-
-function signed [15:0] moving_y_at_time;
-    input signed [15:0] base;
-    input [31:0] t;
-    reg signed [31:0] step;
-    reg signed [31:0] val;
-    begin
-        step = t >> MOVE_SHIFT;
-        val = {{16{base[15]}}, base} + (step * MOVING_VY);
-        moving_y_at_time = clip_y(val);
-    end
-endfunction
-
-function [31:0] retarded_time;
-    input [31:0] t;
-    input [15:0] dist;
-    reg [31:0] delay;
-    begin
-        delay = dist >> PROP_SPEED_SHIFT;
-        retarded_time = (t > delay) ? (t - delay) : 32'd0;
-    end
-endfunction
-
-function signed [15:0] smin16;
-    input signed [15:0] a;
-    input signed [15:0] b;
-    begin
-        smin16 = (a < b) ? a : b;
-    end
-endfunction
-
-function signed [15:0] smax16;
-    input signed [15:0] a;
-    input signed [15:0] b;
-    begin
-        smax16 = (a > b) ? a : b;
-    end
-endfunction
-
-function signed [31:0] orient2d;
-    input signed [15:0] ax;
-    input signed [15:0] ay;
-    input signed [15:0] bx;
-    input signed [15:0] by;
-    input signed [15:0] cx;
-    input signed [15:0] cy;
-    reg signed [31:0] bax;
-    reg signed [31:0] bay;
-    reg signed [31:0] cax;
-    reg signed [31:0] cay;
-    begin
-        bax = bx - ax;
-        bay = by - ay;
-        cax = cx - ax;
-        cay = cy - ay;
-        orient2d = (bax * cay) - (bay * cax);
-    end
-endfunction
-
-function segment_intersects;
-    input signed [15:0] ax;
-    input signed [15:0] ay;
-    input signed [15:0] bx;
-    input signed [15:0] by;
-    input signed [15:0] cx;
-    input signed [15:0] cy;
-    input signed [15:0] dx;
-    input signed [15:0] dy;
-    reg signed [31:0] o1;
-    reg signed [31:0] o2;
-    reg signed [31:0] o3;
-    reg signed [31:0] o4;
-    reg bbox;
-    begin
-        o1 = orient2d(ax, ay, bx, by, cx, cy);
-        o2 = orient2d(ax, ay, bx, by, dx, dy);
-        o3 = orient2d(cx, cy, dx, dy, ax, ay);
-        o4 = orient2d(cx, cy, dx, dy, bx, by);
-
-        bbox = (smax16(smin16(ax, bx), smin16(cx, dx)) <= smin16(smax16(ax, bx), smax16(cx, dx))) &&
-               (smax16(smin16(ay, by), smin16(cy, dy)) <= smin16(smax16(ay, by), smax16(cy, dy)));
-
-        segment_intersects = bbox &&
-            (((o1 <= 0) && (o2 >= 0)) || ((o1 >= 0) && (o2 <= 0))) &&
-            (((o3 <= 0) && (o4 >= 0)) || ((o3 >= 0) && (o4 <= 0)));
-    end
-endfunction
-
-function signed [15:0] mirror_x;
-    input signed [15:0] sx;
-    input signed [15:0] line_x;
-    input horizontal;
-    reg signed [31:0] v;
-    begin
-        if (horizontal) begin
-            mirror_x = sx;
-        end else begin
-            v = ({{16{line_x[15]}}, line_x} <<< 1) - {{16{sx[15]}}, sx};
-            mirror_x = v[15:0];
-        end
-    end
-endfunction
-
-function signed [15:0] mirror_y;
-    input signed [15:0] sy;
-    input signed [15:0] line_y;
-    input horizontal;
-    reg signed [31:0] v;
-    begin
-        if (horizontal) begin
-            v = ({{16{line_y[15]}}, line_y} <<< 1) - {{16{sy[15]}}, sy};
-            mirror_y = v[15:0];
-        end else begin
-            mirror_y = sy;
-        end
+        mx = (dx > dy) ? dx : dy;
+        mn = (dx > dy) ? dy : dx;
+        approx_dist = mx + ((mn * 16'd3) >> 3);
     end
 endfunction
 
@@ -268,227 +210,70 @@ function signed [3:0] sine_lut;
     end
 endfunction
 
-function signed [7:0] wave_contrib;
-    input [15:0] dist;
-    input [31:0] time_value;
-    input [3:0] src_gain;
-    input [3:0] phase_offset;
-    input enabled;
-    input [3:0] path_gain;
-    input invert;
-    reg [31:0] wave_front;
-    reg [31:0] phase;
-    reg signed [3:0] raw;
-    reg [3:0] raw_abs;
-    reg [3:0] atten_abs;
-    reg signed [4:0] atten_signed;
-    reg signed [15:0] scaled;
-    begin
-        wave_front = time_value * SPEED;
+function axis_wall_hit;
+    input signed [17:0] sx;
+    input signed [17:0] sy;
+    input signed [17:0] px;
+    input signed [17:0] py;
+    input signed [17:0] x0;
+    input signed [17:0] y0;
+    input signed [17:0] x1;
+    input signed [17:0] y1;
 
-        if (!enabled || ({16'd0, dist} > wave_front)) begin
-            wave_contrib = 8'sd0;
-        end else begin
-            phase = wave_front - {16'd0, dist};
-            raw = sine_lut(phase[5:2] + phase_offset);
-            raw_abs = (raw < 0) ? -raw : raw;
-            atten_abs = raw_abs >> dist[9:7];
-            atten_signed = (raw < 0) ? -$signed({1'b0, atten_abs}) : $signed({1'b0, atten_abs});
-            scaled = atten_signed * $signed({1'b0, src_gain}) * $signed({1'b0, path_gain});
-            wave_contrib = invert ? -$signed(scaled >>> 6) : $signed(scaled >>> 6);
+    reg signed [17:0] xmin;
+    reg signed [17:0] xmax;
+    reg signed [17:0] ymin;
+    reg signed [17:0] ymax;
+    reg signed [17:0] dx;
+    reg signed [17:0] dy;
+    reg signed [17:0] wx;
+    reg signed [17:0] wy;
+    reg signed [17:0] dxw;
+    reg signed [17:0] dyw;
+    reg signed [47:0] cross;
+    reg signed [47:0] low;
+    reg signed [47:0] high;
+    reg signed [47:0] tmp;
+    begin
+        axis_wall_hit = 1'b0;
+        xmin = (x0 < x1) ? x0 : x1;
+        xmax = (x0 < x1) ? x1 : x0;
+        ymin = (y0 < y1) ? y0 : y1;
+        ymax = (y0 < y1) ? y1 : y0;
+        dx = px - sx;
+        dy = py - sy;
+
+        if (x0 == x1) begin
+            wx = x0;
+            if ((dx != 0) && (((sx <= wx) && (wx <= px)) || ((px <= wx) && (wx <= sx)))) begin
+                dxw = wx - sx;
+                cross = sy * dx + dy * dxw;
+                low   = ymin * dx;
+                high  = ymax * dx;
+                if (low > high) begin
+                    tmp = low;
+                    low = high;
+                    high = tmp;
+                end
+                axis_wall_hit = (cross >= low) && (cross <= high);
+            end
+        end else if (y0 == y1) begin
+            wy = y0;
+            if ((dy != 0) && (((sy <= wy) && (wy <= py)) || ((py <= wy) && (wy <= sy)))) begin
+                dyw = wy - sy;
+                cross = sx * dy + dx * dyw;
+                low   = xmin * dy;
+                high  = xmax * dy;
+                if (low > high) begin
+                    tmp = low;
+                    low = high;
+                    high = tmp;
+                end
+                axis_wall_hit = (cross >= low) && (cross <= high);
+            end
         end
     end
 endfunction
-
-function signed [5:0] clamp6;
-    input signed [11:0] v;
-    begin
-        if (v > 12'sd31)
-            clamp6 = 6'sd31;
-        else if (v < -12'sd32)
-            clamp6 = -6'sd32;
-        else
-            clamp6 = v[5:0];
-    end
-endfunction
-
-reg [31:0]                regfile [REG_FILE_SIZE-1:0];
-reg [REG_FILE_AWIDTH-1:0] writeAddr;
-reg [REG_FILE_AWIDTH-1:0] readAddr;
-reg [31:0]                readData;
-reg [31:0]                writeData;
-reg [1:0]                 readState;
-reg [2:0]                 writeState;
-
-integer axi_i;
-
-always @(posedge s_axi_lite_aclk) begin
-    if (!axi_resetn) begin
-        readState <= AWAIT_RADD;
-        readAddr  <= {REG_FILE_AWIDTH{1'b0}};
-        readData  <= 32'd0;
-    end else begin
-        readData <= regfile[readAddr];
-
-        case (readState)
-            AWAIT_RADD: begin
-                if (s_axi_lite_arvalid) begin
-                    readAddr  <= s_axi_lite_araddr[2 +: REG_FILE_AWIDTH];
-                    readState <= AWAIT_FETCH;
-                end
-            end
-
-            AWAIT_FETCH: begin
-                readState <= AWAIT_READ;
-            end
-
-            AWAIT_READ: begin
-                if (s_axi_lite_rready) begin
-                    readState <= AWAIT_RADD;
-                end
-            end
-
-            default: begin
-                readState <= AWAIT_RADD;
-            end
-        endcase
-    end
-end
-
-assign s_axi_lite_arready = (readState == AWAIT_RADD);
-assign s_axi_lite_rresp   = AXI_OK;
-assign s_axi_lite_rvalid  = (readState == AWAIT_READ);
-assign s_axi_lite_rdata   = readData;
-
-always @(posedge s_axi_lite_aclk) begin
-    if (!axi_resetn) begin
-        writeState <= AWAIT_WADD_AND_DATA;
-        writeAddr  <= {REG_FILE_AWIDTH{1'b0}};
-        writeData  <= 32'd0;
-
-        for (axi_i = 0; axi_i < REG_FILE_SIZE; axi_i = axi_i + 1) begin
-            regfile[axi_i] <= 32'd0;
-        end
-
-        regfile[1]  <= (32'd240 << 16) | 32'd200;
-        regfile[2]  <= (32'd240 << 16) | 32'd440;
-        regfile[3]  <= 32'h00000801;
-        regfile[4]  <= 32'h00000801;
-        regfile[13] <= 32'h00000400;
-        regfile[16] <= 32'h00000400;
-    end else begin
-        case (writeState)
-            AWAIT_WADD_AND_DATA: begin
-                case ({s_axi_lite_awvalid, s_axi_lite_wvalid})
-                    2'b10: begin
-                        writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
-                        writeState <= AWAIT_WDATA;
-                    end
-
-                    2'b01: begin
-                        writeData  <= s_axi_lite_wdata;
-                        writeState <= AWAIT_WADD;
-                    end
-
-                    2'b11: begin
-                        writeData  <= s_axi_lite_wdata;
-                        writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
-                        writeState <= AWAIT_WRITE;
-                    end
-
-                    default: begin
-                        writeState <= AWAIT_WADD_AND_DATA;
-                    end
-                endcase
-            end
-
-            AWAIT_WDATA: begin
-                if (s_axi_lite_wvalid) begin
-                    writeData  <= s_axi_lite_wdata;
-                    writeState <= AWAIT_WRITE;
-                end
-            end
-
-            AWAIT_WADD: begin
-                if (s_axi_lite_awvalid) begin
-                    writeAddr  <= s_axi_lite_awaddr[2 +: REG_FILE_AWIDTH];
-                    writeState <= AWAIT_WRITE;
-                end
-            end
-
-            AWAIT_WRITE: begin
-                regfile[writeAddr] <= writeData;
-                writeState         <= AWAIT_RESP;
-            end
-
-            AWAIT_RESP: begin
-                if (s_axi_lite_bready) begin
-                    writeState <= AWAIT_WADD_AND_DATA;
-                end
-            end
-
-            default: begin
-                writeState <= AWAIT_WADD_AND_DATA;
-            end
-        endcase
-    end
-end
-
-assign s_axi_lite_awready = (writeState == AWAIT_WADD_AND_DATA) ||
-                            (writeState == AWAIT_WADD);
-
-assign s_axi_lite_wready  = (writeState == AWAIT_WADD_AND_DATA) ||
-                            (writeState == AWAIT_WDATA);
-
-assign s_axi_lite_bvalid  = (writeState == AWAIT_RESP);
-assign s_axi_lite_bresp   = AXI_OK;
-
-wire [31:0] current_time = regfile[0];
-
-wire signed [15:0] src1_x0 = regfile[1][15:0];
-wire signed [15:0] src1_y0 = regfile[1][31:16];
-wire signed [15:0] src2_x0 = regfile[2][15:0];
-wire signed [15:0] src2_y0 = regfile[2][31:16];
-
-wire src1_enable = regfile[3][0];
-wire src1_moving = regfile[3][1];
-wire [3:0] src1_phase = regfile[3][7:4];
-wire [3:0] src1_gain  = regfile[3][11:8];
-
-wire src2_enable = regfile[4][0];
-wire src2_moving = regfile[4][1];
-wire [3:0] src2_phase = regfile[4][7:4];
-wire [3:0] src2_gain  = regfile[4][11:8];
-
-wire signed [15:0] blk0_x0 = regfile[5][15:0];
-wire signed [15:0] blk0_y0 = regfile[5][31:16];
-wire signed [15:0] blk0_x1 = regfile[6][15:0];
-wire signed [15:0] blk0_y1 = regfile[6][31:16];
-wire blk0_enable = regfile[7][0];
-
-wire signed [15:0] blk1_x0 = regfile[8][15:0];
-wire signed [15:0] blk1_y0 = regfile[8][31:16];
-wire signed [15:0] blk1_x1 = regfile[9][15:0];
-wire signed [15:0] blk1_y1 = regfile[9][31:16];
-wire blk1_enable = regfile[10][0];
-
-wire signed [15:0] refl0_x0 = regfile[11][15:0];
-wire signed [15:0] refl0_y0 = regfile[11][31:16];
-wire signed [15:0] refl0_x1 = regfile[12][15:0];
-wire signed [15:0] refl0_y1 = regfile[12][31:16];
-wire refl0_enable = regfile[13][0];
-wire [3:0] refl0_gain = regfile[13][11:8];
-wire refl0_invert = regfile[13][12];
-wire refl0_horizontal = (refl0_y0 == refl0_y1);
-
-wire signed [15:0] refl1_x0 = regfile[14][15:0];
-wire signed [15:0] refl1_y0 = regfile[14][31:16];
-wire signed [15:0] refl1_x1 = regfile[15][15:0];
-wire signed [15:0] refl1_y1 = regfile[15][31:16];
-wire refl1_enable = regfile[16][0];
-wire [3:0] refl1_gain = regfile[16][11:8];
-wire refl1_invert = regfile[16][12];
-wire refl1_horizontal = (refl1_y0 == refl1_y1);
 
 reg [9:0] x_in;
 reg [8:0] y_in;
@@ -496,16 +281,15 @@ reg [8:0] y_in;
 wire input_lastx = (x_in == X_SIZE - 1);
 wire input_lasty = (y_in == Y_SIZE - 1);
 
-reg [FIFO_WIDTH-1:0] pixel_fifo [0:FIFO_DEPTH-1];
+reg [7:0] scalar_fifo [0:FIFO_DEPTH-1];
 reg [FIFO_AWIDTH-1:0] fifo_wr_ptr;
 reg [FIFO_AWIDTH-1:0] fifo_rd_ptr;
 reg [FIFO_AWIDTH:0]   fifo_count;
 
 wire fifo_empty = (fifo_count == 0);
 wire fifo_full  = (fifo_count == FIFO_DEPTH);
-wire fifo_valid = !fifo_empty;
-wire fifo_almost_full = (fifo_count >= (FIFO_DEPTH - CORDIC_PIPE_DEPTH - 2));
-wire cordic_input_valid = periph_resetn && !fifo_almost_full;
+wire fifo_almost_full = (fifo_count >= (FIFO_DEPTH - CORDIC_PIPE_DEPTH - 8));
+wire cordic_input_valid = periph_resetn && !paused && !fifo_almost_full;
 
 always @(posedge out_stream_aclk) begin
     if (!periph_resetn) begin
@@ -521,221 +305,203 @@ always @(posedge out_stream_aclk) begin
     end
 end
 
-wire signed [15:0] pix_x_in = {6'd0, x_in};
-wire signed [15:0] pix_y_in = {7'd0, y_in};
+wire signed [17:0] pix_x_in_s = {8'd0, x_in};
+wire signed [17:0] pix_y_in_s = {9'd0, y_in};
 
-wire signed [15:0] src1_x_now_in = src1_moving ? moving_x_at_time(src1_x0, current_time) : src1_x0;
-wire signed [15:0] src1_y_now_in = src1_moving ? moving_y_at_time(src1_y0, current_time) : src1_y0;
-wire signed [15:0] src2_x_now_in = src2_moving ? moving_x_at_time(src2_x0, current_time) : src2_x0;
-wire signed [15:0] src2_y_now_in = src2_moving ? moving_y_at_time(src2_y0, current_time) : src2_y0;
+wire signed [15:0] src_x [0:MAX_SRC-1];
+wire signed [15:0] src_y [0:MAX_SRC-1];
+wire        src_en [0:MAX_SRC-1];
+wire        src_moving [0:MAX_SRC-1];
+wire        src_virtual [0:MAX_SRC-1];
+wire        src_phase_inv [0:MAX_SRC-1];
+wire [3:0]  src_wall_id [0:MAX_SRC-1];
+wire [7:0]  src_amp [0:MAX_SRC-1];
+wire [7:0]  src_freq [0:MAX_SRC-1];
+wire [7:0]  src_phase [0:MAX_SRC-1];
+wire signed [7:0] src_dirx [0:MAX_SRC-1];
+wire signed [7:0] src_diry [0:MAX_SRC-1];
+wire [7:0] src_directivity [0:MAX_SRC-1];
+wire signed [15:0] src_vx [0:MAX_SRC-1];
+wire signed [15:0] src_vy [0:MAX_SRC-1];
 
-wire [15:0] src1_d0_in = approx_dist(pix_x_in, pix_y_in, src1_x_now_in, src1_y_now_in);
-wire [15:0] src2_d0_in = approx_dist(pix_x_in, pix_y_in, src2_x_now_in, src2_y_now_in);
+wire signed [15:0] wall_x0 [0:MAX_WALLS-1];
+wire signed [15:0] wall_y0 [0:MAX_WALLS-1];
+wire signed [15:0] wall_x1 [0:MAX_WALLS-1];
+wire signed [15:0] wall_y1 [0:MAX_WALLS-1];
+wire wall_en [0:MAX_WALLS-1];
+wire wall_reflect [0:MAX_WALLS-1];
+wire wall_phase_inv [0:MAX_WALLS-1];
+wire [7:0] wall_gain [0:MAX_WALLS-1];
 
-wire [31:0] src1_t_ret_in = retarded_time(current_time, src1_d0_in);
-wire [31:0] src2_t_ret_in = retarded_time(current_time, src2_d0_in);
+wire [15:0] cordic_magn [0:MAX_SRC-1];
+wire [15:0] cordic_phase [0:MAX_SRC-1];
+wire [MAX_SRC-1:0] cordic_valid_vec;
 
-wire signed [15:0] src1_x_eff_in = src1_moving ? moving_x_at_time(src1_x0, src1_t_ret_in) : src1_x0;
-wire signed [15:0] src1_y_eff_in = src1_moving ? moving_y_at_time(src1_y0, src1_t_ret_in) : src1_y0;
-wire signed [15:0] src2_x_eff_in = src2_moving ? moving_x_at_time(src2_x0, src2_t_ret_in) : src2_x0;
-wire signed [15:0] src2_y_eff_in = src2_moving ? moving_y_at_time(src2_y0, src2_t_ret_in) : src2_y0;
-
-wire signed [15:0] src1_refl0_x = mirror_x(src1_x0, refl0_x0, refl0_horizontal);
-wire signed [15:0] src1_refl0_y = mirror_y(src1_y0, refl0_y0, refl0_horizontal);
-wire signed [15:0] src2_refl0_x = mirror_x(src2_x0, refl0_x0, refl0_horizontal);
-wire signed [15:0] src2_refl0_y = mirror_y(src2_y0, refl0_y0, refl0_horizontal);
-
-wire signed [15:0] src1_refl1_x = mirror_x(src1_x0, refl1_x0, refl1_horizontal);
-wire signed [15:0] src1_refl1_y = mirror_y(src1_y0, refl1_y0, refl1_horizontal);
-wire signed [15:0] src2_refl1_x = mirror_x(src2_x0, refl1_x0, refl1_horizontal);
-wire signed [15:0] src2_refl1_y = mirror_y(src2_y0, refl1_y0, refl1_horizontal);
-
-wire signed [15:0] dx_dir1  = abs_diff16(pix_x_in, src1_x_eff_in);
-wire signed [15:0] dy_dir1  = abs_diff16(pix_y_in, src1_y_eff_in);
-wire signed [15:0] dx_dir2  = abs_diff16(pix_x_in, src2_x_eff_in);
-wire signed [15:0] dy_dir2  = abs_diff16(pix_y_in, src2_y_eff_in);
-
-wire signed [15:0] dx_r10   = abs_diff16(pix_x_in, src1_refl0_x);
-wire signed [15:0] dy_r10   = abs_diff16(pix_y_in, src1_refl0_y);
-wire signed [15:0] dx_r20   = abs_diff16(pix_x_in, src2_refl0_x);
-wire signed [15:0] dy_r20   = abs_diff16(pix_y_in, src2_refl0_y);
-wire signed [15:0] dx_r11   = abs_diff16(pix_x_in, src1_refl1_x);
-wire signed [15:0] dy_r11   = abs_diff16(pix_y_in, src1_refl1_y);
-wire signed [15:0] dx_r21   = abs_diff16(pix_x_in, src2_refl1_x);
-wire signed [15:0] dy_r21   = abs_diff16(pix_y_in, src2_refl1_y);
-
-wire [15:0] dist_dir1;
-wire [15:0] dist_dir2;
-wire [15:0] dist_r10;
-wire [15:0] dist_r20;
-wire [15:0] dist_r11;
-wire [15:0] dist_r21;
-
-wire [15:0] phase_unused_dir1;
-wire [15:0] phase_unused_dir2;
-wire [15:0] phase_unused_r10;
-wire [15:0] phase_unused_r20;
-wire [15:0] phase_unused_r11;
-wire [15:0] phase_unused_r21;
-
-wire valid_dir1;
-wire valid_dir2;
-wire valid_r10;
-wire valid_r20;
-wire valid_r11;
-wire valid_r21;
-
-cordic_0 cordic_dir1 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_dir1, dx_dir1}),
-    .m_axis_dout_tvalid    (valid_dir1),
-    .m_axis_dout_tdata     ({phase_unused_dir1, dist_dir1})
-);
-
-cordic_0 cordic_dir2 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_dir2, dx_dir2}),
-    .m_axis_dout_tvalid    (valid_dir2),
-    .m_axis_dout_tdata     ({phase_unused_dir2, dist_dir2})
-);
-
-cordic_0 cordic_r10 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_r10, dx_r10}),
-    .m_axis_dout_tvalid    (valid_r10),
-    .m_axis_dout_tdata     ({phase_unused_r10, dist_r10})
-);
-
-cordic_0 cordic_r20 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_r20, dx_r20}),
-    .m_axis_dout_tvalid    (valid_r20),
-    .m_axis_dout_tdata     ({phase_unused_r20, dist_r20})
-);
-
-cordic_0 cordic_r11 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_r11, dx_r11}),
-    .m_axis_dout_tvalid    (valid_r11),
-    .m_axis_dout_tdata     ({phase_unused_r11, dist_r11})
-);
-
-cordic_0 cordic_r21 (
-    .aclk                  (out_stream_aclk),
-    .aresetn               (periph_resetn),
-    .s_axis_cartesian_tvalid(cordic_input_valid),
-    .s_axis_cartesian_tdata ({dy_r21, dx_r21}),
-    .m_axis_dout_tvalid    (valid_r21),
-    .m_axis_dout_tdata     ({phase_unused_r21, dist_r21})
-);
-
-wire cordic_output_valid = valid_dir1 && valid_dir2 && valid_r10 && valid_r20 && valid_r11 && valid_r21;
+wire signed [17:0] src_eff_x [0:MAX_SRC-1];
+wire signed [17:0] src_eff_y [0:MAX_SRC-1];
+wire [15:0] cordic_dx_abs [0:MAX_SRC-1];
+wire [15:0] cordic_dy_abs [0:MAX_SRC-1];
 
 reg [9:0] x_out;
 reg [8:0] y_out;
+wire signed [17:0] pix_x_out_s = {8'd0, x_out};
+wire signed [17:0] pix_y_out_s = {9'd0, y_out};
 
-wire output_first = (x_out == 0) && (y_out == 0);
-wire output_lastx = (x_out == X_SIZE - 1);
-wire output_lasty = (y_out == Y_SIZE - 1);
+wire cordic_output_valid = &cordic_valid_vec;
 
 always @(posedge out_stream_aclk) begin
     if (!periph_resetn) begin
         x_out <= 10'd0;
         y_out <= 9'd0;
     end else if (cordic_output_valid) begin
-        if (output_lastx) begin
+        if (x_out == X_SIZE - 1) begin
             x_out <= 10'd0;
-            y_out <= output_lasty ? 9'd0 : y_out + 1'b1;
+            y_out <= (y_out == Y_SIZE - 1) ? 9'd0 : y_out + 1'b1;
         end else begin
             x_out <= x_out + 1'b1;
         end
     end
 end
 
-wire signed [15:0] pix_x_out = {6'd0, x_out};
-wire signed [15:0] pix_y_out = {7'd0, y_out};
+genvar src_decode_i;
+genvar wall_decode_i;
+generate
+    for (src_decode_i = 0; src_decode_i < MAX_SRC; src_decode_i = src_decode_i + 1) begin : SRC_DECODE
+        localparam integer SBASE = SRC_BASE + src_decode_i * SRC_STRIDE;
+        assign src_x[src_decode_i] = regfile[SBASE + 0][15:0];
+        assign src_y[src_decode_i] = regfile[SBASE + 0][31:16];
+        assign src_en[src_decode_i]        = regfile[SBASE + 1][0];
+        assign src_moving[src_decode_i]    = regfile[SBASE + 1][1];
+        assign src_virtual[src_decode_i]   = regfile[SBASE + 1][2];
+        assign src_phase_inv[src_decode_i] = regfile[SBASE + 1][3];
+        assign src_wall_id[src_decode_i]   = regfile[SBASE + 1][7:4];
+        assign src_amp[src_decode_i]       = regfile[SBASE + 1][15:8];
+        assign src_freq[src_decode_i]      = regfile[SBASE + 1][23:16];
+        assign src_phase[src_decode_i]     = regfile[SBASE + 1][31:24];
+        assign src_dirx[src_decode_i]      = regfile[SBASE + 2][7:0];
+        assign src_diry[src_decode_i]      = regfile[SBASE + 2][15:8];
+        assign src_directivity[src_decode_i] = regfile[SBASE + 2][23:16];
+        assign src_vx[src_decode_i]        = regfile[SBASE + 3][15:0];
+        assign src_vy[src_decode_i]        = regfile[SBASE + 3][31:16];
+    end
 
-wire signed [15:0] src1_x_now_out = src1_moving ? moving_x_at_time(src1_x0, current_time) : src1_x0;
-wire signed [15:0] src1_y_now_out = src1_moving ? moving_y_at_time(src1_y0, current_time) : src1_y0;
-wire signed [15:0] src2_x_now_out = src2_moving ? moving_x_at_time(src2_x0, current_time) : src2_x0;
-wire signed [15:0] src2_y_now_out = src2_moving ? moving_y_at_time(src2_y0, current_time) : src2_y0;
+    for (wall_decode_i = 0; wall_decode_i < MAX_WALLS; wall_decode_i = wall_decode_i + 1) begin : WALL_DECODE
+        localparam integer WBASE = WALL_BASE + wall_decode_i * WALL_STRIDE;
+        assign wall_x0[wall_decode_i] = regfile[WBASE + 0][15:0];
+        assign wall_y0[wall_decode_i] = regfile[WBASE + 0][31:16];
+        assign wall_x1[wall_decode_i] = regfile[WBASE + 1][15:0];
+        assign wall_y1[wall_decode_i] = regfile[WBASE + 1][31:16];
+        assign wall_en[wall_decode_i]        = regfile[WBASE + 2][0];
+        assign wall_reflect[wall_decode_i]   = regfile[WBASE + 2][1];
+        assign wall_phase_inv[wall_decode_i] = regfile[WBASE + 2][2];
+        assign wall_gain[wall_decode_i]      = regfile[WBASE + 2][15:8];
+    end
+endgenerate
 
-wire [15:0] src1_d0_out = approx_dist(pix_x_out, pix_y_out, src1_x_now_out, src1_y_now_out);
-wire [15:0] src2_d0_out = approx_dist(pix_x_out, pix_y_out, src2_x_now_out, src2_y_now_out);
+genvar cordic_i;
+generate
+    for (cordic_i = 0; cordic_i < MAX_SRC; cordic_i = cordic_i + 1) begin : CORDIC_LANES
+        wire signed [17:0] sx_ext = {{2{src_x[cordic_i][15]}}, src_x[cordic_i]};
+        wire signed [17:0] sy_ext = {{2{src_y[cordic_i][15]}}, src_y[cordic_i]};
+        wire signed [17:0] dx0_s = pix_x_in_s - sx_ext;
+        wire signed [17:0] dy0_s = pix_y_in_s - sy_ext;
+        wire [15:0] dx0_abs = abs18(dx0_s);
+        wire [15:0] dy0_abs = abs18(dy0_s);
+        wire [15:0] dist0 = approx_dist(dx0_abs, dy0_abs);
+        wire [15:0] tau0 = dist0 >> 2;
+        wire signed [31:0] move_x = src_vx[cordic_i] * $signed({1'b0, tau0});
+        wire signed [31:0] move_y = src_vy[cordic_i] * $signed({1'b0, tau0});
+        wire signed [17:0] ret_x = sx_ext - (move_x >>> 4);
+        wire signed [17:0] ret_y = sy_ext - (move_y >>> 4);
 
-wire [31:0] src1_t_ret_out = retarded_time(current_time, src1_d0_out);
-wire [31:0] src2_t_ret_out = retarded_time(current_time, src2_d0_out);
+        assign src_eff_x[cordic_i] = (src_moving[cordic_i] && !src_virtual[cordic_i]) ? ret_x : sx_ext;
+        assign src_eff_y[cordic_i] = (src_moving[cordic_i] && !src_virtual[cordic_i]) ? ret_y : sy_ext;
 
-wire signed [15:0] src1_x_eff_out = src1_moving ? moving_x_at_time(src1_x0, src1_t_ret_out) : src1_x0;
-wire signed [15:0] src1_y_eff_out = src1_moving ? moving_y_at_time(src1_y0, src1_t_ret_out) : src1_y0;
-wire signed [15:0] src2_x_eff_out = src2_moving ? moving_x_at_time(src2_x0, src2_t_ret_out) : src2_x0;
-wire signed [15:0] src2_y_eff_out = src2_moving ? moving_y_at_time(src2_y0, src2_t_ret_out) : src2_y0;
+        wire signed [17:0] dx_eff_s = pix_x_in_s - src_eff_x[cordic_i];
+        wire signed [17:0] dy_eff_s = pix_y_in_s - src_eff_y[cordic_i];
+        assign cordic_dx_abs[cordic_i] = abs18(dx_eff_s);
+        assign cordic_dy_abs[cordic_i] = abs18(dy_eff_s);
 
-wire src1_blocked = (blk0_enable && segment_intersects(src1_x_eff_out, src1_y_eff_out, pix_x_out, pix_y_out, blk0_x0, blk0_y0, blk0_x1, blk0_y1)) ||
-                    (blk1_enable && segment_intersects(src1_x_eff_out, src1_y_eff_out, pix_x_out, pix_y_out, blk1_x0, blk1_y0, blk1_x1, blk1_y1));
+        cordic_0 cordic_inst (
+            .aclk                   (out_stream_aclk),
+            .aresetn                (periph_resetn),
+            .s_axis_cartesian_tvalid(cordic_input_valid),
+            .s_axis_cartesian_tdata ({cordic_dy_abs[cordic_i], cordic_dx_abs[cordic_i]}),
+            .m_axis_dout_tvalid     (cordic_valid_vec[cordic_i]),
+            .m_axis_dout_tdata      ({cordic_phase[cordic_i], cordic_magn[cordic_i]})
+        );
+    end
+endgenerate
 
-wire src2_blocked = (blk0_enable && segment_intersects(src2_x_eff_out, src2_y_eff_out, pix_x_out, pix_y_out, blk0_x0, blk0_y0, blk0_x1, blk0_y1)) ||
-                    (blk1_enable && segment_intersects(src2_x_eff_out, src2_y_eff_out, pix_x_out, pix_y_out, blk1_x0, blk1_y0, blk1_x1, blk1_y1));
+wire signed [15:0] contrib [0:MAX_SRC-1];
 
-wire src1_refl0_valid = refl0_enable && !src1_moving && segment_intersects(src1_refl0_x, src1_refl0_y, pix_x_out, pix_y_out, refl0_x0, refl0_y0, refl0_x1, refl0_y1);
-wire src2_refl0_valid = refl0_enable && !src2_moving && segment_intersects(src2_refl0_x, src2_refl0_y, pix_x_out, pix_y_out, refl0_x0, refl0_y0, refl0_x1, refl0_y1);
-wire src1_refl1_valid = refl1_enable && !src1_moving && segment_intersects(src1_refl1_x, src1_refl1_y, pix_x_out, pix_y_out, refl1_x0, refl1_y0, refl1_x1, refl1_y1);
-wire src2_refl1_valid = refl1_enable && !src2_moving && segment_intersects(src2_refl1_x, src2_refl1_y, pix_x_out, pix_y_out, refl1_x0, refl1_y0, refl1_x1, refl1_y1);
+genvar contrib_i;
+genvar contrib_wall_i;
+generate
+    for (contrib_i = 0; contrib_i < MAX_SRC; contrib_i = contrib_i + 1) begin : CONTRIB
+        wire [MAX_WALLS-1:0] absorber_hit;
+        wire [MAX_WALLS-1:0] reflector_hit;
+        wire signed [17:0] src_x_out_s = {{2{src_x[contrib_i][15]}}, src_x[contrib_i]};
+        wire signed [17:0] src_y_out_s = {{2{src_y[contrib_i][15]}}, src_y[contrib_i]};
 
-wire signed [7:0] contrib_dir1 = wave_contrib(dist_dir1, current_time, src1_gain, src1_phase, src1_enable && !src1_blocked, 4'd8, 1'b0);
-wire signed [7:0] contrib_dir2 = wave_contrib(dist_dir2, current_time, src2_gain, src2_phase, src2_enable && !src2_blocked, 4'd8, 1'b0);
+        for (contrib_wall_i = 0; contrib_wall_i < MAX_WALLS; contrib_wall_i = contrib_wall_i + 1) begin : WALL_TESTS
+            wire signed [17:0] wx0_s = {{2{wall_x0[contrib_wall_i][15]}}, wall_x0[contrib_wall_i]};
+            wire signed [17:0] wy0_s = {{2{wall_y0[contrib_wall_i][15]}}, wall_y0[contrib_wall_i]};
+            wire signed [17:0] wx1_s = {{2{wall_x1[contrib_wall_i][15]}}, wall_x1[contrib_wall_i]};
+            wire signed [17:0] wy1_s = {{2{wall_y1[contrib_wall_i][15]}}, wall_y1[contrib_wall_i]};
+            wire hit = axis_wall_hit(src_x_out_s, src_y_out_s, pix_x_out_s, pix_y_out_s,
+                                     wx0_s, wy0_s, wx1_s, wy1_s);
+            assign absorber_hit[contrib_wall_i]  = wall_en[contrib_wall_i] && !wall_reflect[contrib_wall_i] && hit;
+            assign reflector_hit[contrib_wall_i] = wall_en[contrib_wall_i] &&  wall_reflect[contrib_wall_i] && hit;
+        end
 
-wire signed [7:0] contrib_r10 = wave_contrib(dist_r10, current_time, src1_gain, src1_phase, src1_enable && src1_refl0_valid, refl0_gain, refl0_invert);
-wire signed [7:0] contrib_r20 = wave_contrib(dist_r20, current_time, src2_gain, src2_phase, src2_enable && src2_refl0_valid, refl0_gain, refl0_invert);
-wire signed [7:0] contrib_r11 = wave_contrib(dist_r11, current_time, src1_gain, src1_phase, src1_enable && src1_refl1_valid, refl1_gain, refl1_invert);
-wire signed [7:0] contrib_r21 = wave_contrib(dist_r21, current_time, src2_gain, src2_phase, src2_enable && src2_refl1_valid, refl1_gain, refl1_invert);
+        wire blocked = |absorber_hit;
+        wire reflector_ok = (src_wall_id[contrib_i][1:0] == 2'd0) ? reflector_hit[0] :
+                            (src_wall_id[contrib_i][1:0] == 2'd1) ? reflector_hit[1] :
+                            (src_wall_id[contrib_i][1:0] == 2'd2) ? reflector_hit[2] :
+                                                                     reflector_hit[3];
+        wire path_ok = (!src_virtual[contrib_i]) || reflector_ok;
 
-wire signed [11:0] field_sum = {{4{contrib_dir1[7]}}, contrib_dir1} +
-                               {{4{contrib_dir2[7]}}, contrib_dir2} +
-                               {{4{contrib_r10[7]}},  contrib_r10}  +
-                               {{4{contrib_r20[7]}},  contrib_r20}  +
-                               {{4{contrib_r11[7]}},  contrib_r11}  +
-                               {{4{contrib_r21[7]}},  contrib_r21};
-wire signed [5:0] field_clamped = clamp6(field_sum);
+        wire [15:0] dist = cordic_magn[contrib_i];
+        wire [31:0] wave_front_dist = current_time * SPEED;
+        wire arrived = ({16'd0, dist} <= wave_front_dist);
+        wire [31:0] phase_delta = arrived ? (wave_front_dist - {16'd0, dist}) : 32'd0;
+        wire [7:0] freq_q = (src_freq[contrib_i] == 8'd0) ? 8'd16 : src_freq[contrib_i];
+        wire [39:0] phase_mult = phase_delta * freq_q;
+        wire [31:0] phase_arg = (phase_mult >> 4) + {24'd0, src_phase[contrib_i]} + (src_phase_inv[contrib_i] ? 32'd32 : 32'd0);
+        wire signed [3:0] raw_amp = sine_lut(phase_arg[5:2]);
+        wire [4:0] raw_abs = (raw_amp < 0) ? -raw_amp : raw_amp;
+        wire [2:0] atten_shift = dist[9:7];
+        wire [4:0] atten_abs = raw_abs >> atten_shift;
+        wire signed [5:0] atten_signed = (raw_amp < 0) ? -$signed({1'b0, atten_abs}) : $signed({1'b0, atten_abs});
 
-wire is_pos = (field_clamped > 0);
-wire is_neg = (field_clamped < 0);
-wire [5:0] abs_field = is_neg ? -field_clamped : field_clamped;
-wire [3:0] abs_amp = (abs_field > 6'd7) ? 4'd7 : abs_field[3:0];
+        wire signed [17:0] dx_dir = pix_x_out_s - src_x_out_s;
+        wire signed [17:0] dy_dir = pix_y_out_s - src_y_out_s;
+        wire signed [31:0] dot_x = dx_dir * src_dirx[contrib_i];
+        wire signed [31:0] dot_y = dy_dir * src_diry[contrib_i];
+        wire front_lobe = ((dot_x + dot_y) >= 0);
+        wire [7:0] dir_gain = front_lobe ? 8'd255 : (8'd255 - src_directivity[contrib_i]);
+        wire signed [15:0] amp_mult = atten_signed * $signed({1'b0, src_amp[contrib_i]});
+        wire signed [24:0] dir_mult = amp_mult * $signed({1'b0, dir_gain});
+        wire signed [15:0] scaled = dir_mult >>> 14;
 
-wire [7:0] r_wave = is_pos ? (abs_amp * 8'd32) :
-                    is_neg ? (abs_amp * 8'd16) :
-                             8'd0;
+        assign contrib[contrib_i] = (src_en[contrib_i] && arrived && !blocked && path_ok) ? scaled : 16'sd0;
+    end
+endgenerate
 
-wire [7:0] g_wave = is_pos ? (abs_amp * 8'd20) : 8'd0;
-wire [7:0] b_wave = is_neg ? (abs_amp * 8'd32) : 8'd0;
+wire signed [19:0] contrib_sum =
+    contrib[0] + contrib[1] + contrib[2] + contrib[3] +
+    contrib[4] + contrib[5] + contrib[6] + contrib[7];
 
-wire show_wave = (abs_amp != 0);
-wire is_grid_line = (x_out[5:0] == 6'd0) || (y_out[5:0] == 6'd0);
-
-wire [7:0] r_calc = show_wave ? r_wave : (is_grid_line ? 8'hFF : 8'h00);
-wire [7:0] g_calc = show_wave ? g_wave : 8'h00;
-wire [7:0] b_calc = show_wave ? b_wave : 8'h00;
+wire signed [20:0] scalar_tmp = 21'sd128 + contrib_sum;
+wire [7:0] scalar_value = (scalar_tmp < 21'sd0) ? 8'd0 :
+                          (scalar_tmp > 21'sd255) ? 8'd255 :
+                          scalar_tmp[7:0];
 
 wire fifo_wr_en = cordic_output_valid && !fifo_full;
-wire ready;
-wire fifo_rd_en = fifo_valid && ready;
-
-wire        fifo_sof_out = pixel_fifo[fifo_rd_ptr][25];
-wire        fifo_eol_out = pixel_fifo[fifo_rd_ptr][24];
-wire [7:0]  fifo_r_out   = pixel_fifo[fifo_rd_ptr][23:16];
-wire [7:0]  fifo_g_out   = pixel_fifo[fifo_rd_ptr][15:8];
-wire [7:0]  fifo_b_out   = pixel_fifo[fifo_rd_ptr][7:0];
+wire packer_ready;
+wire fifo_rd_en = !fifo_empty && packer_ready;
+wire [7:0] fifo_scalar = scalar_fifo[fifo_rd_ptr];
 
 always @(posedge out_stream_aclk) begin
     if (!periph_resetn) begin
@@ -744,20 +510,12 @@ always @(posedge out_stream_aclk) begin
         fifo_count  <= {(FIFO_AWIDTH+1){1'b0}};
     end else begin
         if (fifo_wr_en) begin
-            pixel_fifo[fifo_wr_ptr] <= {
-                output_first,
-                output_lastx,
-                r_calc,
-                g_calc,
-                b_calc
-            };
-
+            scalar_fifo[fifo_wr_ptr] <= scalar_value;
             fifo_wr_ptr <= fifo_wr_ptr + 1'b1;
         end
 
-        if (fifo_rd_en) begin
+        if (fifo_rd_en)
             fifo_rd_ptr <= fifo_rd_ptr + 1'b1;
-        end
 
         case ({fifo_wr_en, fifo_rd_en})
             2'b10: fifo_count <= fifo_count + 1'b1;
@@ -767,22 +525,21 @@ always @(posedge out_stream_aclk) begin
     end
 end
 
-packer pixel_packer (
-    .aclk              (out_stream_aclk),
-    .aresetn           (periph_resetn),
-    .r                 (fifo_r_out),
-    .g                 (fifo_g_out),
-    .b                 (fifo_b_out),
-    .eol               (fifo_eol_out),
-    .in_stream_ready   (ready),
-    .valid             (fifo_valid),
-    .sof               (fifo_sof_out),
-    .out_stream_tdata  (out_stream_tdata),
-    .out_stream_tkeep  (out_stream_tkeep),
-    .out_stream_tlast  (out_stream_tlast),
-    .out_stream_tready (out_stream_tready),
-    .out_stream_tvalid (out_stream_tvalid),
-    .out_stream_tuser  (out_stream_tuser)
+scalar_packer #(
+    .X_SIZE(X_SIZE),
+    .Y_SIZE(Y_SIZE)
+) scalar_pack_inst (
+    .clk         (out_stream_aclk),
+    .rst_n       (periph_resetn),
+    .scalar_in   (fifo_scalar),
+    .pixel_valid (!fifo_empty),
+    .pixel_ready (packer_ready),
+    .tdata       (out_stream_tdata),
+    .tkeep       (out_stream_tkeep),
+    .tvalid      (out_stream_tvalid),
+    .tready      (out_stream_tready),
+    .tlast       (out_stream_tlast),
+    .tuser       (out_stream_tuser[0])
 );
 
 endmodule
